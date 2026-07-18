@@ -108,8 +108,11 @@ Out of scope for v1, but the design keeps it possible:
 
 ## 6. Milestones
 
-- **M1** — auth & channel bootstrap (`tgfs init`) with grammers.
-- **M2** — chunked, resumable upload/download of a single file.
-- **M3** — SQLite index, `sync`/`ls`/`get`, remote index snapshots.
-- **M4** — hardening: FLOOD_WAIT handling, parallel parts, dedup, encryption.
-- **M5 (optional)** — read-only FUSE mount.
+- [x] **M1** — auth & channel bootstrap (`tgfs init`) with grammers.
+- [x] **M2** — chunked upload/download of a single file (chunk-level resume:
+      already-uploaded chunks are skipped on retry; part-level resume within a
+      chunk is left to M4).
+- [x] **M3** — SQLite index, `sync`/`ls`/`get`, remote index snapshots.
+- [ ] **M4** — hardening: FLOOD_WAIT handling, parallel parts, part-level
+      resume, encryption, index restore from a pinned snapshot.
+- [ ] **M5 (optional)** — read-only FUSE mount.

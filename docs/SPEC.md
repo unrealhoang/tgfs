@@ -54,6 +54,11 @@ stable message IDs, and access control.
   The resulting `(message_id, file_reference)` pair is recorded in the index.
 - Chunk-level **deduplication**: a chunk whose hash is already in the index is
   not re-uploaded (renames and duplicate files cost nothing).
+- Small files are the degenerate case of one-message-per-chunk: thousands of
+  tiny documents run headlong into per-channel rate limits. The planned fix
+  packs many small files' chunks into one uploaded document, addressed by
+  `(message_id, offset)` — design in [PACKING.md](PACKING.md), enabled by a
+  `[pack]` table in the repo config.
 - Uploads are resumable at the part level: chunks above 10 MiB go through
   Telegram's big-file path with 4 parallel 512 KiB part uploads; the
   contiguous prefix of confirmed parts is journaled in the local index
@@ -220,3 +225,5 @@ Out of scope for v1, but the design keeps it possible:
 - [x] **M4.5** — sharing: `share`/`unshare`/`members` on top of channel
       membership and admin rights (§5).
 - [ ] **M5 (optional)** — read-only FUSE mount.
+- [ ] **M6** — small-file packing: many files per uploaded document, driven
+      by repo config (see [PACKING.md](PACKING.md)).

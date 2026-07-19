@@ -12,7 +12,7 @@ use grammers_client::message::InputMessage;
 use grammers_client::{Client, SenderPool, SignInError, media::Media, tl};
 use tokio::io::AsyncRead;
 
-use crate::config::{Config, DEFAULT_CHANNEL_TITLE, session_path};
+use crate::config::{RepoConfig, session_path};
 
 pub struct Tg {
     pub client: Client,
@@ -71,12 +71,12 @@ impl Tg {
     }
 
     /// Find the storage channel among the dialogs, or create a new private
-    /// broadcast channel. Returns `(channel_id, access_hash)`.
-    pub async fn ensure_channel(&self) -> Result<(i64, i64)> {
+    /// broadcast channel. Returns `(channel_id, access_hash, existed)`.
+    pub async fn ensure_channel(&self, title: &str) -> Result<(i64, i64, bool)> {
         let mut dialogs = self.client.iter_dialogs();
         while let Some(dialog) = dialogs.next().await? {
             if let grammers_client::peer::Peer::Channel(channel) = dialog.peer()
-                && channel.title() == DEFAULT_CHANNEL_TITLE
+                && channel.title() == title
             {
                 let id = channel.id().bare_id().context("channel id")?;
                 let auth = self
@@ -86,8 +86,8 @@ impl Tg {
                     .map_err(|e| anyhow::anyhow!("session error: {e}"))?
                     .map(|r| r.auth.hash())
                     .unwrap_or_default();
-                println!("using existing channel \"{DEFAULT_CHANNEL_TITLE}\" ({id})");
-                return Ok((id, auth));
+                println!("using existing channel {title:?} ({id})");
+                return Ok((id, auth, true));
             }
         }
 
@@ -98,7 +98,7 @@ impl Tg {
                 megagroup: false,
                 for_import: false,
                 forum: false,
-                title: DEFAULT_CHANNEL_TITLE.to_string(),
+                title: title.to_string(),
                 about: "tgfs backup storage — do not delete messages".to_string(),
                 geo_point: None,
                 address: None,
@@ -113,14 +113,14 @@ impl Tg {
         };
         for chat in chats {
             if let tl::enums::Chat::Channel(c) = chat {
-                println!("created private channel \"{DEFAULT_CHANNEL_TITLE}\" ({})", c.id);
-                return Ok((c.id, c.access_hash.unwrap_or_default()));
+                println!("created private channel {title:?} ({})", c.id);
+                return Ok((c.id, c.access_hash.unwrap_or_default(), false));
             }
         }
         bail!("CreateChannel response contained no channel")
     }
 
-    pub fn peer(&self, config: &Config) -> Result<PeerRef> {
+    pub fn peer(&self, config: &RepoConfig) -> Result<PeerRef> {
         Ok(PeerRef {
             id: PeerId::channel(config.channel_id).context("invalid channel id in config")?,
             auth: PeerAuth::from_hash(config.channel_access_hash),
@@ -195,6 +195,57 @@ impl Tg {
             .pin_message(peer, msg_id)
             .await
             .context("failed to pin message")
+    }
+
+    /// Read the remote index version from the pinned snapshot's caption
+    /// (`tgfs-index v<N> ...`) without downloading the snapshot itself.
+    /// `None` means the channel has no pinned tgfs-index yet.
+    pub async fn remote_index_info(&self, peer: PeerRef) -> Result<Option<RemoteIndexInfo>> {
+        let Some(msg) = self
+            .client
+            .get_pinned_message(peer)
+            .await
+            .context("failed to fetch pinned message")?
+        else {
+            return Ok(None);
+        };
+        Ok(parse_index_caption(msg.text()).map(|version| RemoteIndexInfo {
+            version,
+            msg_id: msg.id(),
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteIndexInfo {
+    pub version: u64,
+    pub msg_id: i32,
+}
+
+/// Caption format written by snapshot uploads: `tgfs-index v<N> ...`.
+pub fn index_caption(version: u64, files: usize, chunks: usize, created_at: i64) -> String {
+    format!("tgfs-index v{version} files={files} chunks={chunks} created={created_at}")
+}
+
+fn parse_index_caption(text: &str) -> Option<u64> {
+    let rest = text.strip_prefix("tgfs-index v")?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caption_roundtrip() {
+        let caption = index_caption(42, 10, 12, 1_752_000_000);
+        assert_eq!(parse_index_caption(&caption), Some(42));
+        assert_eq!(parse_index_caption("tgfs-index v7"), Some(7));
+        assert_eq!(parse_index_caption("something else"), None);
+        assert_eq!(parse_index_caption("tgfs-index vX"), None);
     }
 }
 

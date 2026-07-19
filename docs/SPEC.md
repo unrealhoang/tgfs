@@ -64,10 +64,10 @@ stable message IDs, and access control.
 Two layers, so the local machine is a cache and Telegram remains the source of
 truth:
 
-1. **Local index** — SQLite (`~/.local/share/tgfs/index.db`): tables for
-   `files` (path, size, mtime, file hash), `chunks` (hash, size, message_id,
-   file_reference), `snapshots` (sync runs). Used for fast diffing during
-   `tgfs sync`.
+1. **Local index** — SQLite (`.tgfs/index.db` inside the synced folder):
+   tables for `files` (path, size, mtime, file hash), `chunks` (hash, size,
+   message_id), `snapshots` (sync runs), and `meta` (index version, base
+   remote version). Used for fast diffing during `tgfs sync`.
 2. **Remote index** — after each sync, the index is serialized (JSON,
    zstd-compressed), uploaded to the same channel as a document, and the
    message is **pinned**. Recovery on a new machine = find the pinned message,
@@ -77,21 +77,50 @@ truth:
 File `file_reference`s expire; the index stores enough (channel id +
 message id) to re-fetch fresh references on demand.
 
+### Index versioning
+
+Every uploaded snapshot carries a monotonically increasing **version**. The
+version is embedded in the pinned message's caption
+(`tgfs-index v<N> files=<n> chunks=<n> created=<unix>`), so comparing local
+and remote state only needs `messages.getPinnedMessage` — no snapshot
+download. The local index remembers the last version it pushed or pulled:
+
+- local == remote — **up to date**; `sync` pushes version N+1.
+- local < remote — **behind** (another machine pushed); `sync` refuses until
+  `tgfs pull` imports the newer remote snapshot (or `--force` overrides).
+- local > remote — **ahead** (a push half-failed or the pin was changed);
+  `sync --force` re-publishes, `pull --force` rolls back.
+
+This is git-flavored optimistic locking, not merging: concurrent writers are
+detected, and the loser is told to pull first.
+
 ## 4. Interface
 
-Easy-to-use CLI, rclone-flavored:
+Folder-based CLI, git-flavored: `tgfs init` runs **inside the folder to back
+up** and creates a `.tgfs/` directory (repo config + local index). Every
+other command discovers the repo by walking up from the current directory,
+and remote paths are relative to the repo root. Each repo gets its own
+private channel, named `tgfs-<folder-name>`.
 
 ```
-tgfs init                 # log in (QR/code), create the private storage channel
-tgfs sync <folder>        # one-way backup: upload new/changed files, tombstone deleted
-tgfs ls [prefix]          # list remote files
-tgfs get <remote> [dest]  # restore a file or folder
+tgfs login               # authenticate the Telegram account (once per machine)
+tgfs init                # in the folder to back up: create .tgfs/ + the channel
+tgfs status              # local changes vs index, and local vs remote version
+tgfs sync                # push new/changed files, tombstone deleted, pin snapshot
+tgfs pull                # import a newer remote index snapshot
+tgfs ls [prefix]         # list indexed files
+tgfs get <path> [dest]   # restore a file or folder from the channel
+tgfs log                 # list index snapshots
 ```
 
 - `tgfs sync` is idempotent and incremental (mtime+size fast path, hash to
   confirm), safe to run from cron/systemd-timer.
-- Config in `~/.config/tgfs/config.toml` (api_id/api_hash, channel, chunk
-  size, parallelism); session key stored with 0600 perms.
+- Account credentials (api_id/api_hash) in `~/.config/tgfs/config.toml` and
+  the MTProto session in `~/.local/share/tgfs/session.db` are per-machine;
+  `.tgfs/config.toml` (channel, chunk size) is per-repo. Secrets are stored
+  with 0600 perms.
+- `tgfs init` in a folder whose channel already exists adopts it and pulls
+  the pinned index — that is the recovery path on a new machine.
 - Nice-to-haves after v1: `--watch` mode, include/exclude globs, `tgfs verify`
   (re-hash remote chunks), `tgfs prune` (drop tombstoned data).
 

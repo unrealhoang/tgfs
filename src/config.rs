@@ -1,18 +1,24 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_CHANNEL_TITLE: &str = "tgfs-storage";
+pub const REPO_DIR: &str = ".tgfs";
 /// 1 GiB — well under the 2 GiB per-file cap, large enough to keep
 /// message count low.
 pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 
+/// Per-machine account credentials (`~/.config/tgfs/config.toml`).
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Config {
+pub struct GlobalConfig {
     pub api_id: i32,
     pub api_hash: String,
-    /// Bare channel id of the storage channel.
+}
+
+/// Per-repo settings (`<repo>/.tgfs/config.toml`).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepoConfig {
+    /// Bare channel id of this repo's storage channel.
     pub channel_id: i64,
     /// Telegram access hash for the storage channel.
     pub channel_access_hash: i64,
@@ -20,11 +26,17 @@ pub struct Config {
     pub chunk_size: u64,
 }
 
+/// A discovered tgfs repo: the folder being backed up plus its `.tgfs/`.
+pub struct Repo {
+    pub root: PathBuf,
+    pub config: RepoConfig,
+}
+
 fn default_chunk_size() -> u64 {
     DEFAULT_CHUNK_SIZE
 }
 
-pub fn config_path() -> Result<PathBuf> {
+pub fn global_config_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("cannot determine config directory")?
         .join("tgfs/config.toml"))
@@ -42,33 +54,87 @@ pub fn session_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("session.db"))
 }
 
-pub fn index_path() -> Result<PathBuf> {
-    Ok(data_dir()?.join("index.db"))
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
-impl Config {
+impl GlobalConfig {
     pub fn load() -> Result<Self> {
-        let path = config_path()?;
+        let path = global_config_path()?;
         let raw = std::fs::read_to_string(&path).with_context(|| {
-            format!(
-                "cannot read {} — run `tgfs init` first",
-                path.display()
-            )
+            format!("cannot read {} — run `tgfs login` first", path.display())
         })?;
         toml::from_str(&raw).with_context(|| format!("invalid config at {}", path.display()))
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        write_private(&global_config_path()?, &toml::to_string_pretty(self)?)
+    }
+}
+
+impl Repo {
+    /// Walk up from `start` looking for a `.tgfs` directory, like git does.
+    pub fn discover(start: &Path) -> Result<Self> {
+        let start = start
+            .canonicalize()
+            .with_context(|| format!("cannot access {}", start.display()))?;
+        for dir in start.ancestors() {
+            let marker = dir.join(REPO_DIR);
+            if marker.is_dir() {
+                let config_path = marker.join("config.toml");
+                let raw = std::fs::read_to_string(&config_path)
+                    .with_context(|| format!("cannot read {}", config_path.display()))?;
+                let config = toml::from_str(&raw)
+                    .with_context(|| format!("invalid config at {}", config_path.display()))?;
+                return Ok(Self {
+                    root: dir.to_path_buf(),
+                    config,
+                });
+            }
         }
-        std::fs::write(&path, toml::to_string_pretty(self)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        bail!(
+            "not inside a tgfs repo (no {REPO_DIR} directory found from {} upward) — \
+             run `tgfs init` in the folder you want to back up",
+            start.display()
+        )
+    }
+
+    /// Create `.tgfs/` in `root` and persist `config`.
+    pub fn create(root: &Path, config: RepoConfig) -> Result<Self> {
+        let root = root.canonicalize()?;
+        let marker = root.join(REPO_DIR);
+        std::fs::create_dir_all(&marker)?;
+        let repo = Self { root, config };
+        repo.save_config()?;
+        Ok(repo)
+    }
+
+    pub fn save_config(&self) -> Result<()> {
+        write_private(
+            &self.root.join(REPO_DIR).join("config.toml"),
+            &toml::to_string_pretty(&self.config)?,
+        )
+    }
+
+    pub fn index_path(&self) -> PathBuf {
+        self.root.join(REPO_DIR).join("index.db")
+    }
+
+    /// Channel title for this repo, derived from the folder name.
+    pub fn channel_title(root: &Path) -> Result<String> {
+        let name = root
+            .file_name()
+            .context("cannot init the filesystem root")?
+            .to_string_lossy();
+        Ok(format!("tgfs-{name}"))
     }
 }

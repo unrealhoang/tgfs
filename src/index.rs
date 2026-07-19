@@ -32,7 +32,9 @@ pub struct ChunkEntry {
 /// Serialized form uploaded to Telegram as the remote index snapshot.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Snapshot {
-    pub version: u32,
+    pub format: u32,
+    /// Monotonically increasing index version (see SPEC "Index versioning").
+    pub version: u64,
     pub created_at: i64,
     pub files: Vec<FileEntry>,
     pub chunks: Vec<ChunkEntry>,
@@ -65,8 +67,13 @@ impl Index {
              );
              CREATE TABLE IF NOT EXISTS snapshots (
                  id         INTEGER PRIMARY KEY,
+                 version    INTEGER NOT NULL DEFAULT 0,
                  created_at INTEGER NOT NULL,
                  msg_id     INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
              );",
         )?;
         Ok(Self { conn })
@@ -203,11 +210,80 @@ impl Index {
         Ok(rows)
     }
 
-    pub fn record_snapshot(&self, created_at: i64, msg_id: i32) -> Result<()> {
+    pub fn record_snapshot(&self, version: u64, created_at: i64, msg_id: i32) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO snapshots (created_at, msg_id) VALUES (?1, ?2)",
-            params![created_at, msg_id],
+            "INSERT INTO snapshots (version, created_at, msg_id) VALUES (?1, ?2, ?3)",
+            params![version, created_at, msg_id],
         )?;
+        Ok(())
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<(u64, i64, i32)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT version, created_at, msg_id FROM snapshots ORDER BY id DESC")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The index version this repo last pushed or pulled (0 = never synced).
+    pub fn version(&self) -> Result<u64> {
+        let v = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+
+    pub fn set_version(&self, version: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![version.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the local index contents with a remote snapshot (pull).
+    pub fn import(&mut self, snapshot: &Snapshot) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute_batch("DELETE FROM file_chunks; DELETE FROM files; DELETE FROM chunks;")?;
+        for chunk in &snapshot.chunks {
+            tx.execute(
+                "INSERT INTO chunks (hash, size, msg_id) VALUES (?1, ?2, ?3)",
+                params![chunk.hash, chunk.size, chunk.msg_id],
+            )?;
+        }
+        for file in &snapshot.files {
+            tx.execute(
+                "INSERT INTO files (path, size, mtime, hash, deleted)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![file.path, file.size, file.mtime, file.hash, file.deleted],
+            )?;
+            let id: i64 = tx.query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                params![file.path],
+                |r| r.get(0),
+            )?;
+            for (seq, hash) in file.chunks.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO file_chunks (file_id, seq, chunk_hash) VALUES (?1, ?2, ?3)",
+                    params![id, seq as i64, hash],
+                )?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![snapshot.version.to_string()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -228,7 +304,8 @@ impl Index {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Snapshot {
-            version: 1,
+            format: 1,
+            version: self.version()?,
             created_at: now_unix(),
             files,
             chunks,
@@ -248,10 +325,11 @@ mod tests {
     use super::*;
 
     fn temp_index() -> (Index, std::path::PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
             "tgfs-test-{}-{}.db",
             std::process::id(),
-            now_unix()
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
         (Index::open(&path).unwrap(), path)
@@ -332,5 +410,53 @@ mod tests {
         assert!(snapshot.files.iter().any(|f| f.deleted));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_and_import() {
+        let (mut index, path) = temp_index();
+        assert_eq!(index.version().unwrap(), 0);
+        index
+            .insert_chunk(&ChunkEntry {
+                hash: "aa".into(),
+                size: 3,
+                msg_id: 7,
+            })
+            .unwrap();
+        index
+            .upsert_file(&FileEntry {
+                path: "a.txt".into(),
+                size: 3,
+                mtime: 1,
+                hash: "h".into(),
+                deleted: false,
+                chunks: vec!["aa".into()],
+            })
+            .unwrap();
+        index.set_version(4).unwrap();
+        let snapshot = index.export().unwrap();
+        assert_eq!(snapshot.version, 4);
+
+        // Import into a fresh index reproduces files, chunks and version.
+        let (mut other, other_path) = temp_index();
+        other
+            .upsert_file(&FileEntry {
+                path: "stale.txt".into(),
+                size: 9,
+                mtime: 9,
+                hash: "x".into(),
+                deleted: false,
+                chunks: vec![],
+            })
+            .unwrap();
+        other.import(&snapshot).unwrap();
+        assert_eq!(other.version().unwrap(), 4);
+        assert!(other.get_file("stale.txt").unwrap().is_none());
+        let restored = other.get_file("a.txt").unwrap().unwrap();
+        assert_eq!(restored.chunks, vec!["aa".to_string()]);
+        assert_eq!(other.chunk("aa").unwrap().unwrap().msg_id, 7);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(other_path);
     }
 }

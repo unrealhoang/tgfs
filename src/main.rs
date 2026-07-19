@@ -170,16 +170,35 @@ async fn init(encrypt: bool) -> Result<()> {
     let global = GlobalConfig::load()?;
     let tg = connect_authorized(&global).await?;
 
-    let encryption_key = if encrypt {
-        let key = crypto::Crypto::key_to_string(&crypto::Crypto::generate_key());
-        println!("generated encryption key: {key}");
-        println!("KEEP IT SAFE: without it, encrypted backups cannot be restored");
-        Some(key)
+    let title = Repo::channel_title(&cwd)?;
+    let (channel_id, channel_access_hash, existed) = tg.ensure_channel(&title).await?;
+
+    // Adopting an existing channel (e.g. on a new machine): fetch its pinned
+    // index so `tgfs get` can restore immediately — prompting for the
+    // encryption key if the snapshot turns out to be sealed.
+    let snapshot = if existed {
+        let peer = tg.peer_from(channel_id, channel_access_hash)?;
+        fetch_remote_snapshot(&tg, peer, None).await?
     } else {
         None
     };
-    let title = Repo::channel_title(&cwd)?;
-    let (channel_id, channel_access_hash, existed) = tg.ensure_channel(&title).await?;
+    let existing_key = snapshot.as_ref().and_then(|f| f.key.clone());
+    let encryption_key = match existing_key {
+        Some(key) => {
+            if encrypt {
+                println!("channel is already encrypted — keeping its existing key");
+            }
+            Some(key)
+        }
+        None if encrypt => {
+            let key = crypto::Crypto::key_to_string(&crypto::Crypto::generate_key());
+            println!("generated encryption key: {key}");
+            println!("KEEP IT SAFE: without it, encrypted backups cannot be restored");
+            Some(key)
+        }
+        None => None,
+    };
+
     let repo = Repo::create(
         &cwd,
         RepoConfig {
@@ -190,11 +209,8 @@ async fn init(encrypt: bool) -> Result<()> {
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
-
-    // Adopting an existing channel (e.g. on a new machine): pull its
-    // pinned index so `tgfs get` can restore immediately.
-    if existed {
-        sync::pull(&tg, &mut index, &repo, false).await?;
+    if let Some(f) = snapshot {
+        sync::import_snapshot(&mut index, &f.plain, f.info)?;
     }
     println!(
         "initialized tgfs repo at {} — `tgfs status` to compare, `tgfs sync` to push",
@@ -246,27 +262,107 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<
         .await?
         .with_context(|| format!("no channel titled {title:?} — see `tgfs channels`"))?;
 
-    // Validate a provided key before writing it into the repo config.
+    // Validate a provided key before doing anything with it.
     if let Some(k) = &key {
         crypto::Crypto::key_from_string(k)?;
     }
+    // Fetch (and, for an encrypted repo, prompt for the key and decrypt)
+    // BEFORE creating the folder, so a wrong key leaves nothing behind.
+    let peer = tg.peer_from(channel.id, channel.access_hash)?;
+    let fetched = fetch_remote_snapshot(&tg, peer, key).await?;
+
     std::fs::create_dir_all(&dest)?;
+    let (encryption_key, snapshot) = match fetched {
+        Some(f) => (f.key, Some((f.info, f.plain))),
+        None => {
+            println!("channel has no index snapshot yet — cloning it empty");
+            (None, None)
+        }
+    };
     let repo = Repo::create(
         &dest,
         RepoConfig {
             channel_id: channel.id,
             channel_access_hash: channel.access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
-            encryption_key: key,
+            encryption_key,
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
-    sync::pull(&tg, &mut index, &repo, false).await?;
+    if let Some((info, plain)) = snapshot {
+        sync::import_snapshot(&mut index, &plain, info)?;
+    }
     println!(
         "cloned {title:?} into {} — `tgfs ls` to browse, `tgfs get <path>` to restore files",
         repo.root.display()
     );
     Ok(())
+}
+
+/// The pinned remote snapshot, decrypted and ready to import, plus the
+/// encryption key that was needed to read it (if any).
+struct FetchedSnapshot {
+    info: tg::RemoteIndexInfo,
+    /// zstd-compressed snapshot JSON (already decrypted).
+    plain: Vec<u8>,
+    /// Key that successfully opened it: from `--key` or an interactive prompt.
+    key: Option<String>,
+}
+
+/// Download the channel's pinned snapshot. If it is encrypted, obtain the
+/// key — from `key_flag` if given, otherwise by prompting (3 attempts) —
+/// and validate it against the snapshot before returning it.
+async fn fetch_remote_snapshot(
+    tg: &Tg,
+    peer: grammers_client::session::types::PeerRef,
+    key_flag: Option<String>,
+) -> Result<Option<FetchedSnapshot>> {
+    let Some(info) = tg.remote_index_info(peer).await? else {
+        return Ok(None);
+    };
+    let mut raw = Vec::new();
+    tg.download_document(peer, info.msg_id, &mut raw).await?;
+
+    if !crypto::Crypto::is_sealed_blob(&raw) {
+        if key_flag.is_some() {
+            println!("note: --key given but this repo's snapshots are not encrypted");
+        }
+        return Ok(Some(FetchedSnapshot {
+            info,
+            plain: raw,
+            key: key_flag,
+        }));
+    }
+
+    let interactive = key_flag.is_none();
+    let mut attempt = 0;
+    let mut key_str = key_flag;
+    loop {
+        attempt += 1;
+        let candidate = match key_str.take() {
+            Some(k) => k,
+            None => {
+                println!("this repo is encrypted; its key is needed to read the index");
+                rpassword::prompt_password("Encryption key (base64): ")?
+                    .trim()
+                    .to_string()
+            }
+        };
+        let opened = crypto::Crypto::key_from_string(&candidate)
+            .map(|k| crypto::Crypto::new(&k))
+            .and_then(|c| c.open_blob(&raw));
+        match opened {
+            Ok(plain) => {
+                return Ok(Some(FetchedSnapshot {
+                    info,
+                    plain,
+                    key: Some(candidate),
+                }));
+            }
+            Err(e) if interactive && attempt < 3 => eprintln!("{e}; try again"),
+            Err(e) => return Err(e.context("cannot decrypt the remote index snapshot")),
+        }
+    }
 }
 
 type OpenedRepo = (Repo, Index, Tg);

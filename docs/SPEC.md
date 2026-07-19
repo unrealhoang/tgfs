@@ -67,7 +67,7 @@ stable message IDs, and access control.
   1 MiB segments, with nonces derived (keyed BLAKE3) from the chunk's
   plaintext hash and segment number. Deterministic ciphertext keeps dedup
   and upload resume working; the per-repo key lives in `.tgfs/config.toml`
-  (`tgfs key` prints it, `tgfs clone --key` supplies it on a new machine).
+  (`tgfs key` prints it; `tgfs clone`/`tgfs init` on a new machine take it via `--key` or prompt for it, validating it against the pinned snapshot).
   Index snapshots are sealed with the same key. Sizes, chunk counts and
   chunk equality remain visible — contents do not.
 

@@ -425,7 +425,14 @@ pub async fn pull(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Resul
         )?;
         raw = crypto.open_blob(&raw)?;
     }
-    let json = zstd::decode_all(raw.as_slice()).context("snapshot is not valid zstd")?;
+    import_snapshot(index, &raw, remote)?;
+    Ok(())
+}
+
+/// Decode a downloaded (already decrypted) snapshot, verify it matches the
+/// pinned caption's version, and replace the local index with it.
+pub fn import_snapshot(index: &mut Index, plain: &[u8], remote: RemoteIndexInfo) -> Result<()> {
+    let json = zstd::decode_all(plain).context("snapshot is not valid zstd")?;
     let snapshot: Snapshot =
         serde_json::from_slice(&json).context("snapshot is not a valid tgfs index")?;
     if snapshot.version != remote.version {

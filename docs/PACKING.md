@@ -143,14 +143,23 @@ During `push`, files are split into two streams:
 - `size < pack.threshold`: the file's single chunk is handed to a
   **pack builder** instead of being uploaded immediately. Chunks
   already in the index (dedup) or empty are skipped exactly as today.
+  Two files with identical content queued in the same batch are stored
+  as **one** member (same-push dedup): both files are still recorded,
+  but only the first occurrence contributes bytes and counts toward the
+  flush threshold — matching the standalone path, which dedups because
+  it inserts each chunk into the index before the next file is scanned.
 
 The pack builder accumulates members `(chunk_hash, abs_path, size)` and
 flushes a pack when the **stored** size would exceed `target_size`, and
-once more at the end of the walk for the remainder. A flush:
+once more at the end of the walk for the remainder. Members hold only
+the file *path*, not an open descriptor — each is opened lazily on read
+— so a pack of thousands of tiny files doesn't hold thousands of
+descriptors at once (which would exhaust the FD limit on exactly the
+workload packing targets). A flush:
 
-1. Fixes the member order (walk order — deterministic because the walk
-   is sorted) and computes each member's stored offset:
-   `offset[i+1] = offset[i] + stored_len(size[i])`.
+1. Fixes the member order (first-occurrence walk order — deterministic
+   because the walk is sorted) and computes each distinct member's
+   stored offset: `offset[i+1] = offset[i] + stored_len(size[i])`.
 2. Names the pack by a *pack hash* — BLAKE3 of the concatenated member
    chunk hashes — and records the in-flight upload under `upload_journal`
    keyed by that hash. This names the pack deterministically without
@@ -182,25 +191,35 @@ chunks → upsert files, mirroring today's per-chunk ordering.
 `tg.rs` gains a ranged download:
 
 ```rust
-async fn download_range(&self, peer, msg_id, offset: u64, len: u64, out) -> Result<u64>
+async fn document_location(&self, peer, msg_id) -> Result<InputFileLocation>
+async fn download_from_location(&self, loc, offset: u64, len: u64, out) -> Result<u64>
 ```
 
-implemented with raw `upload.getFile`: Telegram requires `offset` to be
-4 KiB-aligned (with the `precise` flag) and `limit` a multiple of 4 KiB
-(≤ 1 MiB), so the implementation rounds the requested offset down to
-4 KiB, requests aligned windows, and discards the sub-block slack
-before writing to `out`. Worst-case waste is < 4 KiB + one trailing
-partial block per member — irrelevant at these sizes.
+implemented with raw `upload.getFile`: Telegram requires `offset` and
+`limit` to be 4 KiB-aligned, `limit ≤ 1 MiB`, **and** each request to
+stay within a single 1 MiB block (`offset/1MiB == (offset+limit-1)/1MiB`)
+— a rule the `precise` flag does *not* lift (it only relaxes alignment).
+So each window rounds the offset down to 4 KiB, sizes `limit` to cover
+what's left but never past the next 1 MiB boundary, and discards the
+sub-block slack before writing to `out`. Worst-case waste is < 4 KiB of
+leading slack plus one trailing partial block per member — irrelevant at
+these sizes. The window math (`getfile_limit`) is a pure function with a
+unit test asserting no window ever crosses a boundary. Cross-DC files are
+handled like grammers' own downloader: follow `FILE_MIGRATE`, and on
+`AUTH_KEY_UNREGISTERED` export/import an authorization into the file's DC
+and retry (grammers' helper for this is not public, so it is replicated).
 
 `get` then changes in one place: instead of downloading `chunk.msg_id`
-whole, every chunk read goes through `download_range`, fetching
-`stored_len(chunk.size)` bytes at `chunk.offset`. A standalone chunk is
-just the degenerate case (`offset 0`, length == the whole document), so
-one code path covers both and the index never needs to record document
-sizes. Decryption, the length check, and the whole-file hash check are
-untouched — `DecryptingWriter` already consumes exactly the sealed
-member stream. (Whole-document reads without a known length — the index
-snapshots — keep using the streaming `download_document`.)
+whole, it resolves each message's location once (cached across the whole
+`get`, so N files sharing one packed message cost one metadata fetch, not
+N) and reads `stored_len(chunk.size)` bytes at `chunk.offset`. A
+standalone chunk is just the degenerate case (`offset 0`, length == the
+whole document), so one code path covers both and the index never needs
+to record document sizes. Decryption, the length check, and the
+whole-file hash check are untouched — `DecryptingWriter` already consumes
+exactly the sealed member stream. (Whole-document reads without a known
+length — the index snapshots — keep using the streaming
+`download_document`.)
 
 Restoring a whole packed *directory* naturally issues one ranged read
 per file against the same message; an easy later optimization is

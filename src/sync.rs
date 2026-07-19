@@ -17,9 +17,11 @@ use crate::tg::{PartSource, RemoteIndexInfo, Tg, index_caption, total_parts};
 const HASH_BUF_SIZE: usize = 1024 * 1024;
 
 /// Byte range of a plaintext chunk within its file, read with pread so
-/// multiple upload workers can share it.
+/// multiple upload workers can share it. The file is opened per read rather
+/// than held open, so a pack of thousands of small-file members doesn't
+/// hold thousands of descriptors at once (see PACKING.md).
 struct PlainChunkSource {
-    file: std::fs::File,
+    path: PathBuf,
     base: u64,
     len: u64,
 }
@@ -31,17 +33,18 @@ impl PartSource for PlainChunkSource {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        self.file
-            .read_exact_at(buf, self.base + offset)
+        let file = std::fs::File::open(&self.path)?;
+        file.read_exact_at(buf, self.base + offset)
             .context("chunk read failed (file changed during push?)")
     }
 }
 
 /// Like [`PlainChunkSource`] but exposing the *sealed* bytes: reads cover
 /// whole segments, which are re-encrypted on demand (deterministic nonces
-/// make this stable across retries and resumes).
+/// make this stable across retries and resumes). Opens the file per read
+/// for the same descriptor-thrift reason as [`PlainChunkSource`].
 struct EncryptedChunkSource {
-    file: std::fs::File,
+    path: PathBuf,
     base: u64,
     plain_len: u64,
     crypto: Arc<Crypto>,
@@ -56,6 +59,7 @@ impl PartSource for EncryptedChunkSource {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
+        let file = std::fs::File::open(&self.path)?;
         let sealed_seg = Crypto::sealed_segment_len(crate::crypto::SEGMENT_SIZE);
         let mut written = 0usize;
         while written < buf.len() {
@@ -66,8 +70,7 @@ impl PartSource for EncryptedChunkSource {
             let plain_take =
                 crate::crypto::SEGMENT_SIZE.min(self.plain_len - plain_off) as usize;
             let mut plain = vec![0u8; plain_take];
-            self.file
-                .read_exact_at(&mut plain, self.base + plain_off)
+            file.read_exact_at(&mut plain, self.base + plain_off)
                 .context("chunk read failed (file changed during push?)")?;
             let sealed = self.crypto.seal_segment(self.context.as_bytes(), seg, &plain)?;
             let take = (sealed.len() - in_seg).min(buf.len() - written);
@@ -89,29 +92,59 @@ fn stored_len(plain_len: u64, crypto: &Option<Arc<Crypto>>) -> u64 {
 
 /// Build the [`PartSource`] for one chunk's stored bytes: plaintext, or
 /// per-chunk sealed with `chunk_hash` as the nonce context. `base` is the
-/// chunk's byte offset within the file (0 for a packed small file).
+/// chunk's byte offset within the file (0 for a packed small file). The file
+/// is opened lazily on each read, so building a source is infallible.
 fn chunk_source(
     abs_path: &Path,
     base: u64,
     plain_len: u64,
     chunk_hash: &str,
     crypto: &Option<Arc<Crypto>>,
-) -> Result<Arc<dyn PartSource>> {
-    let file = std::fs::File::open(abs_path)?;
-    Ok(match crypto {
+) -> Arc<dyn PartSource> {
+    match crypto {
         Some(c) => Arc::new(EncryptedChunkSource {
-            file,
+            path: abs_path.to_path_buf(),
             base,
             plain_len,
             crypto: Arc::clone(c),
             context: chunk_hash.to_string(),
         }),
         None => Arc::new(PlainChunkSource {
-            file,
+            path: abs_path.to_path_buf(),
             base,
             len: plain_len,
         }),
-    })
+    }
+}
+
+/// Upload `source` as a document named `name` and return its message id,
+/// journaling progress under `journal_key` so an interrupted upload of the
+/// same bytes resumes. Shared by the standalone-chunk and pack paths.
+async fn upload_journaled(
+    tg: &Tg,
+    index: &mut Index,
+    peer: grammers_client::session::types::PeerRef,
+    source: Arc<dyn PartSource>,
+    name: String,
+    caption: &str,
+    journal_key: &str,
+) -> Result<i32> {
+    let parts = total_parts(source.len());
+    let resume = index
+        .journal_get(journal_key)?
+        .filter(|&(_, journal_total, _)| journal_total == parts)
+        .map(|(file_id, _, done)| (file_id, done));
+    let msg_id = tg
+        .upload_source(peer, source, name, caption, resume, |file_id, done| {
+            if done == 0 {
+                index.journal_start(journal_key, file_id, parts)
+            } else {
+                index.journal_progress(journal_key, done)
+            }
+        })
+        .await?;
+    index.journal_clear(journal_key)?;
+    Ok(msg_id)
 }
 
 /// One member of a pack: its stored bytes and where they sit in the pack.
@@ -168,68 +201,91 @@ struct PackItem {
     chunk_hash: String,
 }
 
+/// Flush any queued small-file members as one pack and reset the batch
+/// accumulators, updating the run counters. A no-op when nothing is queued.
+#[allow(clippy::too_many_arguments)]
+async fn flush_pending(
+    tg: &Tg,
+    index: &mut Index,
+    peer: grammers_client::session::types::PeerRef,
+    crypto: &Option<Arc<Crypto>>,
+    pending: &mut Vec<PackItem>,
+    pending_hashes: &mut std::collections::HashSet<String>,
+    pending_stored: &mut u64,
+    uploaded_bytes: &mut u64,
+    uploaded_files: &mut usize,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    *uploaded_bytes += flush_pack(tg, index, peer, crypto, pending).await?;
+    *uploaded_files += pending.len();
+    pending.clear();
+    pending_hashes.clear();
+    *pending_stored = 0;
+    Ok(())
+}
+
 /// Upload `pending` as one packed document, then record its member chunks
 /// (shared `msg_id`, ascending offsets) and finally upsert the member files.
 /// The ordering (upload → chunks → files) mirrors the standalone path so a
-/// crash never leaves a file referencing an unstored chunk.
+/// crash never leaves a file referencing an unstored chunk. Files with
+/// identical content share a single stored member (same-push dedup). Returns
+/// the plaintext bytes actually uploaded (distinct members only).
 async fn flush_pack(
     tg: &Tg,
     index: &mut Index,
     peer: grammers_client::session::types::PeerRef,
     crypto: &Option<Arc<Crypto>>,
     pending: &[PackItem],
-) -> Result<()> {
+) -> Result<u64> {
     if pending.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
-    let mut members = Vec::with_capacity(pending.len());
-    let mut offsets = Vec::with_capacity(pending.len());
+    // One member per distinct content, in first-occurrence order; duplicate
+    // files still get recorded below but reference the shared member.
+    let mut members = Vec::new();
+    let mut distinct: Vec<(&PackItem, u64)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut stored_offset = 0u64;
     // Name the pack deterministically by its member chunk hashes, so an
     // interrupted upload resumes only when rebuilt to the exact same pack.
     let mut pack_hasher = blake3::Hasher::new();
     for item in pending {
+        if !seen.insert(item.chunk_hash.as_str()) {
+            continue;
+        }
         pack_hasher.update(item.chunk_hash.as_bytes());
         let member_len = stored_len(item.size, crypto);
-        let source = chunk_source(&item.abs_path, 0, item.size, &item.chunk_hash, crypto)?;
-        offsets.push(stored_offset);
+        let source = chunk_source(&item.abs_path, 0, item.size, &item.chunk_hash, crypto);
         members.push(PackMember {
             source,
             stored_offset,
             stored_len: member_len,
         });
+        distinct.push((item, stored_offset));
         stored_offset += member_len;
     }
     let total = stored_offset;
     let pack_hash = pack_hasher.finalize().to_hex().to_string();
     let source: Arc<dyn PartSource> = Arc::new(PackSource { members, total });
 
-    let parts = total_parts(total);
-    let resume = index
-        .journal_get(&pack_hash)?
-        .filter(|&(_, journal_total, _)| journal_total == parts)
-        .map(|(file_id, _, done)| (file_id, done));
     let name = format!("pack-{}.bin", &pack_hash[..16]);
-    let caption = format!("pack files={} bytes={total}", pending.len());
+    let caption = format!(
+        "pack files={} chunks={} bytes={total}",
+        pending.len(),
+        distinct.len()
+    );
     println!("  ↑ {caption}");
-    let msg_id = tg
-        .upload_source(peer, source, name, &caption, resume, |file_id, done| {
-            if done == 0 {
-                index.journal_start(&pack_hash, file_id, parts)
-            } else {
-                index.journal_progress(&pack_hash, done)
-            }
-        })
-        .await?;
-    index.journal_clear(&pack_hash)?;
+    let msg_id = upload_journaled(tg, index, peer, source, name, &caption, &pack_hash).await?;
 
-    for (item, offset) in pending.iter().zip(offsets) {
+    for (item, offset) in &distinct {
         index.insert_chunk(&ChunkEntry {
             hash: item.chunk_hash.clone(),
             size: item.size,
             msg_id,
-            offset,
+            offset: *offset,
             encrypted: crypto.is_some(),
         })?;
     }
@@ -244,7 +300,7 @@ async fn flush_pack(
         })?;
         println!("✓ {}", item.rel_path);
     }
-    Ok(())
+    Ok(distinct.iter().map(|(item, _)| item.size).sum())
 }
 
 /// Hash a file, returning the whole-file hash and the hash of every
@@ -453,6 +509,9 @@ pub async fn push(
 
     let pack = &repo.config.pack;
     let mut pending: Vec<PackItem> = Vec::new();
+    // Distinct member hashes currently queued, so identical files in the same
+    // batch are stored once but each still recorded.
+    let mut pending_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut pending_stored = 0u64;
 
     for file in walk_repo(repo)? {
@@ -491,15 +550,27 @@ pub async fn push(
                 println!("✓ {}", file.rel_path);
                 continue;
             }
-            let member_len = stored_len(file.size, &crypto);
-            if !pending.is_empty() && pending_stored + member_len > pack.target_size {
-                for item in &pending {
-                    uploaded_bytes += item.size;
+            // A new distinct member counts toward the pack's size and can
+            // trigger a flush; a same-batch duplicate is queued (so its file
+            // is recorded) but stored only once, so it adds no bytes.
+            if !pending_hashes.contains(&chunk_hash) {
+                let member_len = stored_len(file.size, &crypto);
+                if !pending.is_empty() && pending_stored + member_len > pack.target_size {
+                    flush_pending(
+                        tg,
+                        index,
+                        peer,
+                        &crypto,
+                        &mut pending,
+                        &mut pending_hashes,
+                        &mut pending_stored,
+                        &mut uploaded_bytes,
+                        &mut uploaded_files,
+                    )
+                    .await?;
                 }
-                uploaded_files += pending.len();
-                flush_pack(tg, index, peer, &crypto, &pending).await?;
-                pending.clear();
-                pending_stored = 0;
+                pending_hashes.insert(chunk_hash.clone());
+                pending_stored += member_len;
             }
             pending.push(PackItem {
                 rel_path: file.rel_path.clone(),
@@ -509,7 +580,6 @@ pub async fn push(
                 file_hash,
                 chunk_hash,
             });
-            pending_stored += member_len;
             continue;
         }
 
@@ -520,26 +590,11 @@ pub async fn push(
             }
             let offset = seq as u64 * repo.config.chunk_size;
             let chunk_len = (file.size - offset).min(repo.config.chunk_size);
-            let source = chunk_source(&file.abs_path, offset, chunk_len, chunk_hash, &crypto)?;
-            let parts = total_parts(source.len());
-            // Resume a matching interrupted upload of this very chunk.
-            let resume = index
-                .journal_get(chunk_hash)?
-                .filter(|&(_, journal_total, _)| journal_total == parts)
-                .map(|(file_id, _, done)| (file_id, done));
+            let source = chunk_source(&file.abs_path, offset, chunk_len, chunk_hash, &crypto);
             let name = format!("{}.bin", &chunk_hash[..16]);
             let caption = format!("{} [{}/{total}]", file.rel_path, seq + 1);
             println!("  ↑ {caption} ({chunk_len} bytes)");
-            let msg_id = tg
-                .upload_source(peer, source, name, &caption, resume, |file_id, done| {
-                    if done == 0 {
-                        index.journal_start(chunk_hash, file_id, parts)
-                    } else {
-                        index.journal_progress(chunk_hash, done)
-                    }
-                })
-                .await?;
-            index.journal_clear(chunk_hash)?;
+            let msg_id = upload_journaled(tg, index, peer, source, name, &caption, chunk_hash).await?;
             index.insert_chunk(&ChunkEntry {
                 hash: chunk_hash.clone(),
                 size: chunk_len,
@@ -562,14 +617,18 @@ pub async fn push(
     }
 
     // Flush the final partial pack.
-    if !pending.is_empty() {
-        for item in &pending {
-            uploaded_bytes += item.size;
-        }
-        uploaded_files += pending.len();
-        flush_pack(tg, index, peer, &crypto, &pending).await?;
-        pending.clear();
-    }
+    flush_pending(
+        tg,
+        index,
+        peer,
+        &crypto,
+        &mut pending,
+        &mut pending_hashes,
+        &mut pending_stored,
+        &mut uploaded_bytes,
+        &mut uploaded_files,
+    )
+    .await?;
 
     let tombstoned = index.tombstone_missing("", &alive)?;
 
@@ -714,6 +773,10 @@ pub async fn get(
     };
     let peer = tg.peer(&repo.config)?;
     let crypto = key.map(Crypto::new);
+    // Many restored files can share one packed message; resolve each message's
+    // download location once and reuse it across their ranged reads.
+    let mut locations: std::collections::HashMap<i32, crate::tg::InputFileLocation> =
+        std::collections::HashMap::new();
 
     for file in targets {
         let out_path = dest.join(&file.path);
@@ -727,6 +790,14 @@ pub async fn get(
             let chunk = index
                 .chunk(chunk_hash)?
                 .with_context(|| format!("chunk {chunk_hash} missing from index"))?;
+            let location = match locations.get(&chunk.msg_id) {
+                Some(loc) => loc.clone(),
+                None => {
+                    let loc = tg.document_location(peer, chunk.msg_id).await?;
+                    locations.insert(chunk.msg_id, loc.clone());
+                    loc
+                }
+            };
             let mut writer = HashingWriter {
                 inner: &mut out,
                 hasher: &mut hasher,
@@ -742,12 +813,12 @@ pub async fn get(
                     DecryptingWriter::new(&mut writer, crypto, chunk_hash.as_bytes(), chunk.size);
                 let expected = Crypto::sealed_len(chunk.size);
                 let n = tg
-                    .download_range(peer, chunk.msg_id, chunk.offset, expected, &mut decryptor)
+                    .download_from_location(&location, chunk.offset, expected, &mut decryptor)
                     .await?;
                 (n, expected)
             } else {
                 let n = tg
-                    .download_range(peer, chunk.msg_id, chunk.offset, chunk.size, &mut writer)
+                    .download_from_location(&location, chunk.offset, chunk.size, &mut writer)
                     .await?;
                 (n, chunk.size)
             };
@@ -829,7 +900,7 @@ mod tests {
 
         let crypto = Arc::new(Crypto::new(&[9u8; 32]));
         let source = EncryptedChunkSource {
-            file: std::fs::File::open(&path).unwrap(),
+            path: path.clone(),
             base,
             plain_len,
             crypto: Arc::clone(&crypto),
@@ -873,7 +944,7 @@ mod tests {
             let path = dir.join(format!("m{i}"));
             std::fs::write(&path, body).unwrap();
             let len = body.len() as u64;
-            let source = chunk_source(&path, 0, len, &format!("h{i}"), &None).unwrap();
+            let source = chunk_source(&path, 0, len, &format!("h{i}"), &None);
             offsets.push(stored_offset);
             members.push(PackMember {
                 source,
@@ -922,7 +993,7 @@ mod tests {
             std::fs::write(&path, &body).unwrap();
             let ctx = format!("ctx{i}");
             let len = stored_len(size, &crypto);
-            let source = chunk_source(&path, 0, size, &ctx, &crypto).unwrap();
+            let source = chunk_source(&path, 0, size, &ctx, &crypto);
             members.push((PackMember {
                 source,
                 stored_offset,

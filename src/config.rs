@@ -226,6 +226,7 @@ impl Repo {
 
     /// Create `.tgfs/` in `root` and persist `config`.
     pub fn create(root: &Path, config: RepoConfig) -> Result<Self> {
+        config.pack.validate(config.chunk_size)?;
         let root = root.canonicalize()?;
         let marker = root.join(REPO_DIR);
         std::fs::create_dir_all(&marker)?;

@@ -14,6 +14,10 @@ use tokio::io::AsyncRead;
 use crate::config::{RepoConfig, session_path};
 use crate::session::FileSession;
 
+/// A resolved document download location, reused across ranged reads of the
+/// same packed message (see [`Tg::document_location`]).
+pub use grammers_client::tl::enums::InputFileLocation;
+
 /// Telegram upload part size. Must be a power of two ≤ 512 KiB.
 pub const PART_SIZE: u64 = 512 * 1024;
 /// Above this, Telegram requires the big-file upload path (which is also the
@@ -75,6 +79,18 @@ pub trait PartSource: Send + Sync {
 
 pub fn total_parts(len: u64) -> i32 {
     len.div_ceil(PART_SIZE) as i32
+}
+
+/// Size of the next `upload.getFile` request reading from `pos`: enough to
+/// cover `want` more bytes, rounded up to `align`, but never spanning a
+/// `block` boundary (Telegram rejects a request that crosses one, even with
+/// the `precise` flag). `pos` must be a multiple of `align`, and `align` must
+/// divide `block`; the result is then a positive multiple of `align` no
+/// larger than `block`, so downloads always make progress and stay legal.
+fn getfile_limit(pos: u64, want: u64, align: u64, block: u64) -> u64 {
+    let aligned = want.next_multiple_of(align);
+    let to_boundary = block - (pos % block);
+    aligned.min(to_boundary)
 }
 
 pub struct Tg {
@@ -369,14 +385,13 @@ impl Tg {
         self.send_uploaded(peer, uploaded, caption).await
     }
 
-    /// Stream the document in message `msg_id` into `out`, returning the
-    /// number of bytes written.
-    pub async fn download_document<W: std::io::Write>(
+    /// Fetch message `msg_id` and return its document, or an error if the
+    /// message is missing or carries something other than a document.
+    async fn message_document(
         &self,
         peer: PeerRef,
         msg_id: i32,
-        out: &mut W,
-    ) -> Result<u64> {
+    ) -> Result<grammers_client::media::Document> {
         let msgs = self.client.get_messages_by_id(peer, &[msg_id]).await?;
         let msg = msgs
             .into_iter()
@@ -386,10 +401,21 @@ impl Tg {
         let media = msg
             .media()
             .with_context(|| format!("message {msg_id} has no media"))?;
-        let doc = match media {
-            Media::Document(doc) => doc,
+        match media {
+            Media::Document(doc) => Ok(doc),
             other => bail!("message {msg_id} is not a document: {other:?}"),
-        };
+        }
+    }
+
+    /// Stream the document in message `msg_id` into `out`, returning the
+    /// number of bytes written.
+    pub async fn download_document<W: std::io::Write>(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        out: &mut W,
+    ) -> Result<u64> {
+        let doc = self.message_document(peer, msg_id).await?;
         let mut total = 0u64;
         let mut download = self.client.iter_download(&doc);
         while let Some(chunk) = download
@@ -403,57 +429,50 @@ impl Tg {
         Ok(total)
     }
 
-    /// Stream `len` bytes starting at byte `offset` of the document in
-    /// message `msg_id` into `out`, returning the number of bytes written.
-    /// Used to read one packed chunk out of a shared document (see
-    /// PACKING.md). Telegram's `upload.getFile` wants 4 KiB-aligned offsets
-    /// and limits, so we request 4 KiB-aligned windows (with `precise` to
-    /// lift the 1 MiB-boundary restriction) and discard the sub-block slack.
-    pub async fn download_range<W: std::io::Write>(
+    /// Resolve the downloadable location of the document in `msg_id`. Callers
+    /// restoring several packed chunks from one message resolve it once and
+    /// reuse it across [`Self::download_from_location`] calls.
+    pub async fn document_location(
         &self,
         peer: PeerRef,
         msg_id: i32,
+    ) -> Result<tl::enums::InputFileLocation> {
+        use grammers_client::media::Downloadable;
+        let doc = self.message_document(peer, msg_id).await?;
+        doc.to_raw_input_location()
+            .with_context(|| format!("message {msg_id} document has no downloadable location"))
+    }
+
+    /// Stream `len` bytes starting at byte `offset` of `location` into `out`,
+    /// returning the number of bytes written — used to read one packed chunk
+    /// out of a shared document (see PACKING.md). Each `upload.getFile` must
+    /// stay 4 KiB-aligned *and* within a single 1 MiB block (Telegram enforces
+    /// the block boundary even with `precise`), so we request aligned windows
+    /// that stop at the next boundary and discard the sub-block slack.
+    pub async fn download_from_location<W: std::io::Write>(
+        &self,
+        location: &tl::enums::InputFileLocation,
         offset: u64,
         len: u64,
         out: &mut W,
     ) -> Result<u64> {
-        use grammers_client::media::Downloadable;
-
         const ALIGN: u64 = 4 * 1024;
-        /// Max bytes per `getFile` request; a multiple of `ALIGN` and within
-        /// Telegram's 1 MiB limit.
-        const MAX_REQUEST: u64 = 1024 * 1024;
+        /// Telegram requires each request to lie within one 1 MiB block.
+        const BLOCK: u64 = 1024 * 1024;
 
         if len == 0 {
             return Ok(0);
         }
-        let msgs = self.client.get_messages_by_id(peer, &[msg_id]).await?;
-        let msg = msgs
-            .into_iter()
-            .next()
-            .flatten()
-            .with_context(|| format!("message {msg_id} not found in storage channel"))?;
-        let media = msg
-            .media()
-            .with_context(|| format!("message {msg_id} has no media"))?;
-        let doc = match media {
-            Media::Document(doc) => doc,
-            other => bail!("message {msg_id} is not a document: {other:?}"),
-        };
-        let location = doc
-            .to_raw_input_location()
-            .with_context(|| format!("message {msg_id} document has no downloadable location"))?;
-
         let mut written = 0u64;
         let mut pos = offset - (offset % ALIGN); // 4 KiB-aligned request offset
         let mut discard = (offset - pos) as usize; // leading slack to drop
         let mut remaining = len;
         while remaining > 0 {
-            let need = discard as u64 + remaining;
-            let limit = need.min(MAX_REQUEST).next_multiple_of(ALIGN);
-            let bytes = self.get_file(&location, pos as i64, limit as i32).await?;
+            let want = discard as u64 + remaining;
+            let limit = getfile_limit(pos, want, ALIGN, BLOCK);
+            let bytes = self.get_file(location, pos as i64, limit as i32).await?;
             if bytes.len() <= discard {
-                bail!("ranged download of message {msg_id} returned short read");
+                bail!("ranged download returned short read");
             }
             let avail = &bytes[discard..];
             let take = avail.len().min(remaining as usize);
@@ -469,7 +488,9 @@ impl Tg {
         Ok(written)
     }
 
-    /// One `upload.getFile` call, retrying on a file-DC migration.
+    /// One `upload.getFile` call, following file-DC migrations and importing
+    /// an authorization into the file's DC when it has none yet (grammers'
+    /// own `iter_download` does this, but its helper is not public).
     async fn get_file(
         &self,
         location: &tl::enums::InputFileLocation,
@@ -484,19 +505,61 @@ impl Tg {
             offset,
             limit,
         };
-        let result = match self.client.invoke(&request).await {
-            Err(grammers_client::InvocationError::Rpc(err)) if err.code == 303 => {
-                // FILE_MIGRATE_X: the document lives on another data center.
-                let dc = err.value.context("file migrate error without a target DC")?;
-                self.client.invoke_in_dc(dc as i32, &request).await
+        // `dc == None` means the account's home DC; a FILE_MIGRATE moves us to
+        // the file's DC (which can chain). Bounded so a persistent error ends.
+        let mut dc: Option<i32> = None;
+        let mut attempts = 0;
+        let file = loop {
+            attempts += 1;
+            let outcome = match dc {
+                Some(d) => self.client.invoke_in_dc(d, &request).await,
+                None => self.client.invoke(&request).await,
+            };
+            match outcome {
+                Ok(file) => break file,
+                Err(grammers_client::InvocationError::Rpc(err))
+                    if err.code == 303 && attempts <= 4 =>
+                {
+                    // FILE_MIGRATE_X: the document lives on another data center.
+                    dc = Some(
+                        err.value.context("file migrate error without a target DC")? as i32,
+                    );
+                }
+                Err(grammers_client::InvocationError::Rpc(err))
+                    if err.name == "AUTH_KEY_UNREGISTERED" && dc.is_some() && attempts <= 4 =>
+                {
+                    // First read from the file's DC: authorize it, then retry.
+                    self.copy_auth_to_dc(dc.expect("guarded by dc.is_some()"))
+                        .await?;
+                }
+                Err(e) => return Err(e).context("upload.getFile failed"),
             }
-            other => other,
-        }
-        .context("upload.getFile failed")?;
-        match result {
+        };
+        match file {
             File::File(f) => Ok(f.bytes),
             File::CdnRedirect(_) => bail!("unexpected CDN redirect for storage document"),
         }
+    }
+
+    /// Export an authorization from the home DC and import it into `dc`, so
+    /// downloads of a file stored on another data center succeed.
+    async fn copy_auth_to_dc(&self, dc: i32) -> Result<()> {
+        let tl::enums::auth::ExportedAuthorization::Authorization(auth) = self
+            .client
+            .invoke(&tl::functions::auth::ExportAuthorization { dc_id: dc })
+            .await
+            .context("failed to export authorization for the file DC")?;
+        self.client
+            .invoke_in_dc(
+                dc,
+                &tl::functions::auth::ImportAuthorization {
+                    id: auth.id,
+                    bytes: auth.bytes,
+                },
+            )
+            .await
+            .context("failed to import authorization into the file DC")?;
+        Ok(())
     }
 
     pub async fn pin(&self, peer: PeerRef, msg_id: i32) -> Result<()> {
@@ -669,6 +732,37 @@ fn parse_index_caption(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn getfile_limit_never_crosses_a_block_boundary() {
+        const ALIGN: u64 = 4 * 1024;
+        const BLOCK: u64 = 1024 * 1024;
+        // A member spanning the whole document, walked window by window from a
+        // deliberately unaligned start (the case the old code got wrong).
+        for &start in &[0u64, 900_000, 1_048_575, 3_000_000, 5 * BLOCK - 7] {
+            let mut pos = start - (start % ALIGN);
+            let total_len = 700_000u64; // spans multiple blocks from most starts
+            let mut remaining = total_len + (start - pos);
+            let mut iterations = 0;
+            while remaining > 0 {
+                let limit = getfile_limit(pos, remaining, ALIGN, BLOCK);
+                assert!(limit > 0 && limit.is_multiple_of(ALIGN), "limit {limit} misaligned");
+                assert!(limit <= BLOCK, "limit {limit} exceeds block");
+                // The whole [pos, pos+limit) window lies in one 1 MiB block.
+                assert_eq!(
+                    pos / BLOCK,
+                    (pos + limit - 1) / BLOCK,
+                    "window [{pos}, {}) crosses a block boundary",
+                    pos + limit
+                );
+                let consumed = limit.min(remaining);
+                remaining -= consumed;
+                pos += limit;
+                iterations += 1;
+                assert!(iterations < 10_000, "no progress");
+            }
+        }
+    }
 
     #[test]
     fn caption_roundtrip() {

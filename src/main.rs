@@ -381,8 +381,12 @@ async fn init(encrypt: bool, no_pack: bool, supplied_key: Option<[u8; 32]>) -> R
             chunk_size: config::DEFAULT_CHUNK_SIZE,
             encrypted: encrypt || remote_encrypted,
             key_verifier: effective_key.map(crypto::Crypto::key_verifier),
+            // Adopting a channel that already exists may share it with
+            // machines on older tgfs binaries; leave packing off there so a
+            // format-2 snapshot doesn't lock them out (see PACKING.md §8).
+            // Enabling it later is an explicit edit to `.tgfs/config.toml`.
             pack: config::PackConfig {
-                enabled: !no_pack,
+                enabled: !no_pack && !existed,
                 ..Default::default()
             },
         },
@@ -462,10 +466,10 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<[u8; 32]>) -> Resul
             chunk_size: config::DEFAULT_CHUNK_SIZE,
             encrypted,
             key_verifier: key.as_ref().map(crypto::Crypto::key_verifier),
-            pack: config::PackConfig {
-                enabled: true,
-                ..Default::default()
-            },
+            // A clone adopts an existing (often shared) channel, so default
+            // packing off to avoid locking out co-readers on older tgfs
+            // binaries; enable it explicitly in `.tgfs/config.toml` if wanted.
+            pack: config::PackConfig::default(),
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;

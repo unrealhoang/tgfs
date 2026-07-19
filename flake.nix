@@ -20,14 +20,8 @@
             src = pkgs.lib.cleanSource self;
             cargoLock.lockFile = ./Cargo.lock;
 
-            # libsql-ffi (grammers session storage) compiles its bundled
-            # sqlite via cmake and can regenerate bindings with bindgen;
-            # zstd-sys / rusqlite / blake3 only need a C compiler.
-            nativeBuildInputs = [
-              pkgs.cmake
-              pkgs.rustPlatform.bindgenHook
-            ];
-
+            # zstd-sys, rusqlite (bundled sqlite) and blake3 only need the
+            # stdenv C compiler; no extra native inputs required.
             # Tests are hermetic (no network); keep them on.
             doCheck = true;
 
@@ -48,7 +42,6 @@
             clippy
             rustfmt
             rust-analyzer
-            cmake
           ];
           inputsFrom = [ self.packages.${system}.tgfs ];
 

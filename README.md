@@ -29,6 +29,16 @@ and `pull` compare the local index version against the pinned one, so two
 machines backing up the same folder detect each other's pushes instead of
 silently clobbering them.
 
+### Building
+
+With cargo: `cargo build --release`. With nix flakes:
+
+```
+nix build          # build the tgfs package
+nix run . -- help  # run it
+nix develop        # devshell with cargo, clippy, rustfmt, rust-analyzer
+```
+
 Status: early development. See [docs/SPEC.md](docs/SPEC.md) for the design
 (Telegram API limits, chunked uploads, metadata index, versioning, optional
 FUSE mount).

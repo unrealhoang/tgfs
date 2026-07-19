@@ -1,6 +1,6 @@
 # Packing small files — design
 
-Status: **design** (not yet implemented). Extends [SPEC.md](SPEC.md) §2.
+Status: **implemented**. Extends [SPEC.md](SPEC.md) §2.
 
 tgfs is unreleased, so this design carries **no migration or backward
 compatibility**: the schema and snapshot shape below are simply what the

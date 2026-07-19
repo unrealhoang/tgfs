@@ -2,13 +2,65 @@
 
 use std::sync::Arc;
 
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
+use grammers_client::session::types::PeerRef;
 
 use crate::context::RepoContext;
 use crate::crypto::Crypto;
 use crate::diff;
 use crate::file;
+use crate::index::FileEntry;
 use crate::snapshot::{self, RemoteIndexInfo};
+
+#[derive(Default)]
+struct PendingPack {
+    members: Vec<file::PackMember>,
+    files: Vec<FileEntry>,
+    hashes: HashSet<String>,
+    stored_size: u64,
+}
+
+impl PendingPack {
+    fn contains(&self, hash: &str) -> bool {
+        self.hashes.contains(hash)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn would_exceed(&self, stored_len: u64, target_size: u64) -> bool {
+        !self.is_empty() && self.stored_size + stored_len > target_size
+    }
+
+    fn add_member(&mut self, member: file::PackMember) {
+        self.stored_size += member.stored_len;
+        self.hashes.insert(member.hash.clone());
+        self.members.push(member);
+    }
+}
+
+async fn flush_pack(
+    context: &mut RepoContext,
+    peer: PeerRef,
+    pending: &mut PendingPack,
+    crypto: Option<&Arc<Crypto>>,
+) -> Result<(usize, u64)> {
+    if pending.is_empty() {
+        return Ok((0, 0));
+    }
+    let pack = std::mem::take(pending);
+    let uploaded_bytes =
+        file::upload_pack(&context.tg, &context.index, peer, pack.members, crypto).await?;
+    let uploaded_files = pack.files.len();
+    for entry in pack.files {
+        context.index.upsert_file(&entry)?;
+        println!("✓ {}", entry.path);
+    }
+    Ok((uploaded_files, uploaded_bytes))
+}
 
 /// How the local index relates to the remote pinned snapshot.
 pub enum VersionState {
@@ -107,6 +159,7 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
     let mut uploaded_files = 0usize;
     let mut uploaded_bytes = 0u64;
     let mut skipped = 0usize;
+    let mut pending_pack = PendingPack::default();
 
     for local_file in diff::walk_repo(&context.repo)? {
         alive.push(local_file.rel_path.clone());
@@ -116,6 +169,48 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
             && existing.mtime == local_file.mtime
         {
             skipped += 1;
+            continue;
+        }
+
+        if context.repo.config.pack.threshold > 0
+            && local_file.size < context.repo.config.pack.threshold
+        {
+            let entry = file::prepare(&local_file, context.repo.config.chunk_size)?;
+            let Some(chunk_hash) = entry.chunks.first() else {
+                context.index.upsert_file(&entry)?;
+                uploaded_files += 1;
+                println!("✓ {}", local_file.rel_path);
+                continue;
+            };
+            if context.index.chunk(chunk_hash)?.is_some() {
+                context.index.upsert_file(&entry)?;
+                uploaded_files += 1;
+                println!("✓ {}", local_file.rel_path);
+                continue;
+            }
+
+            if !pending_pack.contains(chunk_hash) {
+                let stored_len = if crypto.is_some() {
+                    Crypto::sealed_len(local_file.size)
+                } else {
+                    local_file.size
+                };
+                if pending_pack.would_exceed(stored_len, context.repo.config.pack.target_size) {
+                    let (files, bytes) =
+                        flush_pack(context, peer, &mut pending_pack, crypto.as_ref()).await?;
+                    uploaded_files += files;
+                    uploaded_bytes += bytes;
+                }
+                let member = file::PackMember::new(
+                    chunk_hash.clone(),
+                    local_file.abs_path.clone(),
+                    local_file.size,
+                    pending_pack.stored_size,
+                    crypto.is_some(),
+                );
+                pending_pack.add_member(member);
+            }
+            pending_pack.files.push(entry);
             continue;
         }
 
@@ -133,6 +228,10 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
         uploaded_files += 1;
         println!("✓ {}", local_file.rel_path);
     }
+
+    let (files, bytes) = flush_pack(context, peer, &mut pending_pack, crypto.as_ref()).await?;
+    uploaded_files += files;
+    uploaded_bytes += bytes;
 
     let tombstoned = context.index.tombstone_missing("", &alive)?;
     println!(

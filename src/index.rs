@@ -29,6 +29,9 @@ pub struct ChunkEntry {
     /// Plaintext size; the uploaded document is larger when encrypted.
     pub size: u64,
     pub msg_id: i32,
+    /// Byte offset within the stored Telegram document.
+    #[serde(default)]
+    pub offset: u64,
     /// Whether the uploaded document is sealed with the repo key.
     #[serde(default)]
     pub encrypted: bool,
@@ -86,6 +89,7 @@ impl Index {
                  hash      TEXT PRIMARY KEY,
                  size      INTEGER NOT NULL,
                  msg_id    INTEGER NOT NULL,
+                 offset    INTEGER NOT NULL DEFAULT 0,
                  encrypted INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS file_chunks (
@@ -139,7 +143,7 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT hash, size, msg_id, encrypted FROM chunks WHERE hash = ?1",
+                "SELECT hash, size, msg_id, offset, encrypted FROM chunks WHERE hash = ?1",
                 params![hash],
                 ChunkEntry::try_from_row,
             )
@@ -147,10 +151,27 @@ impl Index {
     }
 
     pub fn insert_chunk(&self, chunk: &ChunkEntry) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO chunks (hash, size, msg_id, encrypted) VALUES (?1, ?2, ?3, ?4)",
-            params![chunk.hash, chunk.size, chunk.msg_id, chunk.encrypted],
-        )?;
+        self.insert_chunks(std::slice::from_ref(chunk))?;
+        Ok(())
+    }
+
+    /// Atomically insert all members of one uploaded document.
+    pub fn insert_chunks(&self, chunks: &[ChunkEntry]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for chunk in chunks {
+            tx.execute(
+                "INSERT OR REPLACE INTO chunks (hash, size, msg_id, offset, encrypted)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    chunk.hash,
+                    chunk.size,
+                    chunk.msg_id,
+                    chunk.offset,
+                    chunk.encrypted
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -245,11 +266,9 @@ impl Index {
     pub fn version(&self) -> Result<u64> {
         let v = self
             .conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'version'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
+            .query_row("SELECT value FROM meta WHERE key = 'version'", [], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()?;
         Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
     }
@@ -308,8 +327,15 @@ impl Index {
         tx.execute_batch("DELETE FROM file_chunks; DELETE FROM files; DELETE FROM chunks;")?;
         for chunk in &snapshot.chunks {
             tx.execute(
-                "INSERT INTO chunks (hash, size, msg_id, encrypted) VALUES (?1, ?2, ?3, ?4)",
-                params![chunk.hash, chunk.size, chunk.msg_id, chunk.encrypted],
+                "INSERT INTO chunks (hash, size, msg_id, offset, encrypted)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    chunk.hash,
+                    chunk.size,
+                    chunk.msg_id,
+                    chunk.offset,
+                    chunk.encrypted
+                ],
             )?;
         }
         for file in &snapshot.files {
@@ -347,7 +373,7 @@ impl Index {
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT hash, size, msg_id, encrypted FROM chunks")?;
+            .prepare("SELECT hash, size, msg_id, offset, encrypted FROM chunks")?;
         let chunks = stmt
             .query_map([], ChunkEntry::try_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -384,6 +410,13 @@ mod tests {
     }
 
     #[test]
+    fn old_snapshot_chunk_defaults_to_offset_zero() {
+        let chunk: ChunkEntry =
+            serde_json::from_str(r#"{"hash":"aa","size":3,"msg_id":7,"encrypted":false}"#).unwrap();
+        assert_eq!(chunk.offset, 0);
+    }
+
+    #[test]
     fn file_roundtrip_and_dedup() {
         let (mut index, path) = temp_index();
         index
@@ -391,6 +424,7 @@ mod tests {
                 hash: "aa".into(),
                 size: 10,
                 msg_id: 1,
+                offset: 0,
                 encrypted: false,
             })
             .unwrap();
@@ -399,6 +433,7 @@ mod tests {
                 hash: "bb".into(),
                 size: 5,
                 msg_id: 2,
+                offset: 10,
                 encrypted: false,
             })
             .unwrap();
@@ -471,6 +506,7 @@ mod tests {
                 hash: "aa".into(),
                 size: 3,
                 msg_id: 7,
+                offset: 123,
                 encrypted: true,
             })
             .unwrap();
@@ -507,6 +543,7 @@ mod tests {
         assert_eq!(restored.chunks, vec!["aa".to_string()]);
         let chunk = other.chunk("aa").unwrap().unwrap();
         assert_eq!(chunk.msg_id, 7);
+        assert_eq!(chunk.offset, 123);
         assert!(chunk.encrypted);
 
         let _ = std::fs::remove_file(path);

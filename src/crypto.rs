@@ -210,7 +210,11 @@ mod tests {
         bad[0] ^= 1;
         assert!(c.open_segment(b"ctx", 0, &bad).is_err());
         // Wrong key fails.
-        assert!(Crypto::new(&[8u8; 32]).open_segment(b"ctx", 0, &sealed).is_err());
+        assert!(
+            Crypto::new(&[8u8; 32])
+                .open_segment(b"ctx", 0, &sealed)
+                .is_err()
+        );
     }
 
     #[test]

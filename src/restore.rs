@@ -36,6 +36,7 @@ pub async fn get(
     };
     let peer = context.tg.peer(&context.repo.config)?;
     let crypto = key.map(Crypto::new);
+    let mut documents = std::collections::HashMap::new();
 
     for target in targets {
         let out_path = file::download(
@@ -45,6 +46,7 @@ pub async fn get(
             &target,
             &dest,
             crypto.as_ref(),
+            &mut documents,
         )
         .await?;
         println!("✓ {} → {}", target.path, out_path.display());

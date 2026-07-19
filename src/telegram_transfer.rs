@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use grammers_client::media::Media;
+use grammers_client::media::{Document, Media};
 use grammers_client::message::InputMessage;
 use grammers_client::session::types::PeerRef;
 use grammers_client::tl;
@@ -180,13 +180,9 @@ impl Tg {
         self.send_uploaded(peer, uploaded, caption).await
     }
 
-    /// Stream a document into `out`, returning the number of bytes written.
-    pub async fn download_document<W: std::io::Write>(
-        &self,
-        peer: PeerRef,
-        msg_id: i32,
-        out: &mut W,
-    ) -> Result<u64> {
+    /// Resolve one document message. Callers restoring packed files can cache
+    /// this value so all members of a pack share one message lookup.
+    pub async fn document(&self, peer: PeerRef, msg_id: i32) -> Result<Document> {
         let messages = self.client.get_messages_by_id(peer, &[msg_id]).await?;
         let message = messages
             .into_iter()
@@ -196,10 +192,56 @@ impl Tg {
         let media = message
             .media()
             .with_context(|| format!("message {msg_id} has no media"))?;
-        let document = match media {
-            Media::Document(document) => document,
+        match media {
+            Media::Document(document) => Ok(document),
             other => bail!("message {msg_id} is not a document: {other:?}"),
-        };
+        }
+    }
+
+    /// Write exactly `len` stored bytes beginning at `offset` in `document`.
+    /// Telegram requests remain aligned to grammers' default 512 KiB chunks.
+    pub async fn download_range<W: std::io::Write>(
+        &self,
+        document: &Document,
+        offset: u64,
+        len: u64,
+        out: &mut W,
+    ) -> Result<u64> {
+        offset
+            .checked_add(len)
+            .context("ranged download offset overflow")?;
+        let first_chunk = i32::try_from(offset / PART_SIZE)
+            .context("ranged download offset exceeds Telegram's limits")?;
+        let mut leading = (offset % PART_SIZE) as usize;
+        let mut remaining = len;
+        let mut written = 0u64;
+        let mut download = self.client.iter_download(document).skip_chunks(first_chunk);
+        while remaining > 0 {
+            let Some(chunk) = download.next().await.context("ranged download failed")? else {
+                break;
+            };
+            if leading >= chunk.len() {
+                leading -= chunk.len();
+                continue;
+            }
+            let available = &chunk[leading..];
+            leading = 0;
+            let take = remaining.min(available.len() as u64) as usize;
+            out.write_all(&available[..take])?;
+            remaining -= take as u64;
+            written += take as u64;
+        }
+        Ok(written)
+    }
+
+    /// Stream a whole document into `out`, returning the number of bytes written.
+    pub async fn download_document<W: std::io::Write>(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        out: &mut W,
+    ) -> Result<u64> {
+        let document = self.document(peer, msg_id).await?;
         let mut total = 0u64;
         let mut download = self.client.iter_download(&document);
         while let Some(chunk) = download

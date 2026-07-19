@@ -159,10 +159,7 @@ async fn init(encrypt: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
     let remote_encrypted = snapshot.as_ref().is_some_and(|snapshot| snapshot.encrypted);
     let generated_key = if encrypt && supplied_key.is_none() && !remote_encrypted {
         let key = key::generate();
-        println!(
-            "generated encryption key: {}",
-            key::encode(&key)
-        );
+        println!("generated encryption key: {}", key::encode(&key));
         println!("KEEP IT SAFE: pass it with --key or --keyfile for encrypted operations");
         Some(key)
     } else {
@@ -176,6 +173,7 @@ async fn init(encrypt: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
             channel_id,
             channel_access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
+            pack: config::PackConfig::default(),
             encrypted: encrypt || remote_encrypted,
             key_verifier: effective_key.map(key::verifier),
         },
@@ -201,7 +199,10 @@ async fn channels() -> Result<()> {
         return Ok(());
     }
     for channel in found {
-        let name = channel.title.strip_prefix("tgfs-").unwrap_or(&channel.title);
+        let name = channel
+            .title
+            .strip_prefix("tgfs-")
+            .unwrap_or(&channel.title);
         let peer = tg.peer_from(channel.id, channel.access_hash)?;
         let remote = match tg.remote_index_info(peer).await {
             Ok(Some(info)) => format!("index v{}", info.version),
@@ -253,6 +254,7 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<[u8; 32]>) -> Resul
             channel_id: channel.id,
             channel_access_hash: channel.access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
+            pack: config::PackConfig::default(),
             encrypted,
             key_verifier: key.as_ref().map(key::verifier),
         },
@@ -356,6 +358,7 @@ mod cli_tests {
                 channel_id: 1,
                 channel_access_hash: 2,
                 chunk_size: config::DEFAULT_CHUNK_SIZE,
+                pack: config::PackConfig::default(),
                 encrypted,
                 key_verifier: verifier,
             },
@@ -431,10 +434,8 @@ mod cli_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "tgfs-genkey-test-{}-{unique}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("tgfs-genkey-test-{}-{unique}", std::process::id()));
         generate_keyfile(&path).unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.ends_with('\n'));
@@ -452,7 +453,10 @@ mod cli_tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -464,10 +468,7 @@ mod cli_tests {
         let mut repo = repo_with_verifier(false, None);
         assert!(configure_repo_encryption(&mut repo, Some(&first)).unwrap());
         assert!(repo.config.encrypted);
-        assert_eq!(
-            repo.config.key_verifier,
-            Some(key::verifier(&first))
-        );
+        assert_eq!(repo.config.key_verifier, Some(key::verifier(&first)));
         let serialized = toml::to_string(&repo.config).unwrap();
         assert!(serialized.contains("encrypted = true"));
         assert!(serialized.contains("key_verifier"));

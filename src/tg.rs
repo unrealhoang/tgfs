@@ -69,10 +69,7 @@ impl Tg {
     pub async fn login_interactive(&self, api_hash: &str) -> Result<()> {
         if self.client.is_authorized().await? {
             let me = self.client.get_me().await?;
-            println!(
-                "already logged in as {}",
-                me.full_name()
-            );
+            println!("already logged in as {}", me.full_name());
             return Ok(());
         }
         let phone = prompt("Phone number (international format, e.g. +84...): ")?;

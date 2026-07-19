@@ -14,6 +14,69 @@ use tokio::io::AsyncRead;
 
 use crate::config::{RepoConfig, session_path};
 
+/// Telegram upload part size. Must be a power of two ≤ 512 KiB.
+pub const PART_SIZE: u64 = 512 * 1024;
+/// Above this, Telegram requires the big-file upload path (which is also the
+/// resumable one).
+pub const BIG_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
+const UPLOAD_WORKERS: usize = 4;
+
+/// Retry policy tuned for unattended backups: sleep out flood waits up to
+/// 30 minutes (Telegram tells us how long), retry a few times on transient
+/// I/O errors with exponential backoff.
+struct BackupRetry;
+
+impl grammers_client::client::RetryPolicy for BackupRetry {
+    fn should_retry(
+        &self,
+        ctx: &grammers_client::client::RetryContext,
+    ) -> std::ops::ControlFlow<(), std::time::Duration> {
+        use std::ops::ControlFlow;
+        use std::time::Duration;
+        match &ctx.error {
+            grammers_client::InvocationError::Rpc(err) if err.code == 420 => {
+                let secs = err.value.unwrap_or(1) as u64;
+                if ctx.fail_count.get() <= 5 && secs <= 30 * 60 {
+                    tracing::warn!("flood wait: sleeping {secs}s before retrying");
+                    ControlFlow::Continue(Duration::from_secs(secs + 1))
+                } else {
+                    ControlFlow::Break(())
+                }
+            }
+            grammers_client::InvocationError::Io(_) if ctx.fail_count.get() <= 5 => {
+                ControlFlow::Continue(Duration::from_secs(1 << ctx.fail_count.get().min(5)))
+            }
+            _ => ControlFlow::Break(()),
+        }
+    }
+}
+
+/// Random-access byte source for the resumable uploader. Implementations
+/// must be cheap to read from multiple tasks at once (pread-style).
+pub trait PartSource: Send + Sync {
+    /// Total number of bytes this source will upload.
+    fn len(&self) -> u64;
+    /// Fill `buf` exactly, starting at `offset`.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
+
+    #[allow(dead_code)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn read_part(&self, part: i32) -> Result<Vec<u8>> {
+        let offset = part as u64 * PART_SIZE;
+        let len = PART_SIZE.min(self.len() - offset) as usize;
+        let mut buf = vec![0u8; len];
+        self.read_at(offset, &mut buf)?;
+        Ok(buf)
+    }
+}
+
+pub fn total_parts(len: u64) -> i32 {
+    len.div_ceil(PART_SIZE) as i32
+}
+
 pub struct Tg {
     pub client: Client,
     session: Arc<SqliteSession>,
@@ -28,7 +91,13 @@ impl Tg {
                 .map_err(|e| anyhow::anyhow!("cannot open session store: {e}"))?,
         );
         let pool = SenderPool::new(Arc::clone(&session), api_id);
-        let client = Client::new(pool.handle);
+        let client = Client::with_configuration(
+            pool.handle,
+            grammers_client::client::ClientConfiguration {
+                retry_policy: Box::new(BackupRetry),
+                ..Default::default()
+            },
+        );
         tokio::spawn(pool.runner.run());
         Ok(Self { client, session })
     }
@@ -169,6 +238,15 @@ impl Tg {
             .upload_stream(stream, size, name)
             .await
             .context("upload failed")?;
+        self.send_uploaded(peer, uploaded, caption).await
+    }
+
+    async fn send_uploaded(
+        &self,
+        peer: PeerRef,
+        uploaded: grammers_client::media::Uploaded,
+        caption: &str,
+    ) -> Result<i32> {
         let msg = self
             .client
             .send_message(
@@ -181,6 +259,115 @@ impl Tg {
             .await
             .context("failed to send document message")?;
         Ok(msg.id())
+    }
+
+    /// Upload a [`PartSource`] as a document and send it. Files above
+    /// [`BIG_FILE_THRESHOLD`] go through Telegram's big-file path with
+    /// [`UPLOAD_WORKERS`] parallel part uploads and are resumable:
+    /// `resume` continues a previous attempt (same Telegram `file_id`), and
+    /// `on_progress(file_id, done_parts)` is called as the contiguous prefix
+    /// of confirmed parts grows, so the caller can journal it.
+    pub async fn upload_source(
+        &self,
+        peer: PeerRef,
+        source: Arc<dyn PartSource>,
+        name: String,
+        caption: &str,
+        resume: Option<(i64, i32)>,
+        mut on_progress: impl FnMut(i64, i32) -> Result<()>,
+    ) -> Result<i32> {
+        let len = source.len();
+        if len == 0 {
+            bail!("refusing to upload an empty document");
+        }
+
+        if len <= BIG_FILE_THRESHOLD {
+            let mut buf = vec![0u8; len as usize];
+            source.read_at(0, &mut buf)?;
+            let mut cursor = std::io::Cursor::new(buf);
+            let uploaded = self
+                .client
+                .upload_stream(&mut cursor, len as usize, name)
+                .await
+                .context("upload failed")?;
+            return self.send_uploaded(peer, uploaded, caption).await;
+        }
+
+        let total = total_parts(len);
+        let (file_id, start) = match resume {
+            Some((id, done)) => {
+                println!("    resuming upload at part {done}/{total}");
+                (id, done)
+            }
+            None => (rand::random::<i64>(), 0),
+        };
+        on_progress(file_id, start)?;
+
+        // Workers pull part numbers from a shared counter and report each
+        // confirmed part back; this task tracks the contiguous prefix.
+        let next = Arc::new(std::sync::atomic::AtomicI32::new(start));
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..UPLOAD_WORKERS {
+            let client = self.client.clone();
+            let source = Arc::clone(&source);
+            let next = Arc::clone(&next);
+            let done_tx = done_tx.clone();
+            workers.spawn(async move {
+                loop {
+                    let part = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if part >= total {
+                        return Ok(());
+                    }
+                    let bytes = source.read_part(part)?;
+                    let ok = client
+                        .invoke(&tl::functions::upload::SaveBigFilePart {
+                            file_id,
+                            file_part: part,
+                            file_total_parts: total,
+                            bytes,
+                        })
+                        .await
+                        .with_context(|| format!("failed to upload part {part}/{total}"))?;
+                    if !ok {
+                        bail!("Telegram rejected part {part}/{total}");
+                    }
+                    if done_tx.send(part).is_err() {
+                        return Ok(());
+                    }
+                }
+            });
+        }
+        drop(done_tx);
+
+        let mut confirmed = std::collections::BTreeSet::new();
+        let mut watermark = start;
+        while let Some(part) = done_rx.recv().await {
+            confirmed.insert(part);
+            let mut advanced = false;
+            while confirmed.remove(&watermark) {
+                watermark += 1;
+                advanced = true;
+            }
+            if advanced {
+                on_progress(file_id, watermark)?;
+            }
+        }
+        while let Some(result) = workers.join_next().await {
+            result.context("upload worker panicked")??;
+        }
+        if watermark != total {
+            bail!("upload incomplete: {watermark}/{total} parts confirmed");
+        }
+
+        let uploaded = grammers_client::media::Uploaded {
+            raw: tl::enums::InputFile::Big(tl::types::InputFileBig {
+                id: file_id,
+                parts: total,
+                name,
+            }),
+        };
+        self.send_uploaded(peer, uploaded, caption).await
     }
 
     /// Stream the document in message `msg_id` into `out`, returning the

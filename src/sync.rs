@@ -6,13 +6,77 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+use std::sync::Arc;
 
 use crate::config::{REPO_DIR, Repo};
+use crate::crypto::{Crypto, DecryptingWriter};
 use crate::index::{ChunkEntry, FileEntry, Index, Snapshot};
-use crate::tg::{RemoteIndexInfo, Tg, index_caption};
+use crate::tg::{PartSource, RemoteIndexInfo, Tg, index_caption, total_parts};
 
 const HASH_BUF_SIZE: usize = 1024 * 1024;
+
+/// Byte range of a plaintext chunk within its file, read with pread so
+/// multiple upload workers can share it.
+struct PlainChunkSource {
+    file: std::fs::File,
+    base: u64,
+    len: u64,
+}
+
+impl PartSource for PlainChunkSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .read_exact_at(buf, self.base + offset)
+            .context("chunk read failed (file changed during sync?)")
+    }
+}
+
+/// Like [`PlainChunkSource`] but exposing the *sealed* bytes: reads cover
+/// whole segments, which are re-encrypted on demand (deterministic nonces
+/// make this stable across retries and resumes).
+struct EncryptedChunkSource {
+    file: std::fs::File,
+    base: u64,
+    plain_len: u64,
+    crypto: Arc<Crypto>,
+    /// Chunk plaintext hash (hex) — the nonce context.
+    context: String,
+}
+
+impl PartSource for EncryptedChunkSource {
+    fn len(&self) -> u64 {
+        Crypto::sealed_len(self.plain_len)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let sealed_seg = Crypto::sealed_segment_len(crate::crypto::SEGMENT_SIZE);
+        let mut written = 0usize;
+        while written < buf.len() {
+            let pos = offset + written as u64;
+            let seg = pos / sealed_seg;
+            let in_seg = (pos % sealed_seg) as usize;
+            let plain_off = seg * crate::crypto::SEGMENT_SIZE;
+            let plain_take =
+                crate::crypto::SEGMENT_SIZE.min(self.plain_len - plain_off) as usize;
+            let mut plain = vec![0u8; plain_take];
+            self.file
+                .read_exact_at(&mut plain, self.base + plain_off)
+                .context("chunk read failed (file changed during sync?)")?;
+            let sealed = self.crypto.seal_segment(self.context.as_bytes(), seg, &plain)?;
+            let take = (sealed.len() - in_seg).min(buf.len() - written);
+            buf[written..written + take].copy_from_slice(&sealed[in_seg..in_seg + take]);
+            written += take;
+        }
+        Ok(())
+    }
+}
 
 /// Hash a file, returning the whole-file hash and the hash of every
 /// `chunk_size`-sized chunk (streaming; nothing is held in memory).
@@ -186,6 +250,7 @@ pub async fn status(tg: &Tg, index: &Index, repo: &Repo) -> Result<()> {
 /// One-way sync of the repo into its channel, guarded by the version check.
 pub async fn sync(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Result<()> {
     let peer = tg.peer(&repo.config)?;
+    let crypto = repo.crypto()?.map(Arc::new);
 
     let local_version = index.version()?;
     let remote = tg.remote_index_info(peer).await?;
@@ -229,19 +294,45 @@ pub async fn sync(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Resul
             }
             let offset = seq as u64 * repo.config.chunk_size;
             let chunk_len = (file.size - offset).min(repo.config.chunk_size);
-            let mut f = tokio::fs::File::open(&file.abs_path).await?;
-            f.seek(std::io::SeekFrom::Start(offset)).await?;
-            let mut stream = f.take(chunk_len);
+            let opened = std::fs::File::open(&file.abs_path)?;
+            let source: Arc<dyn PartSource> = match &crypto {
+                Some(c) => Arc::new(EncryptedChunkSource {
+                    file: opened,
+                    base: offset,
+                    plain_len: chunk_len,
+                    crypto: Arc::clone(c),
+                    context: chunk_hash.clone(),
+                }),
+                None => Arc::new(PlainChunkSource {
+                    file: opened,
+                    base: offset,
+                    len: chunk_len,
+                }),
+            };
+            let parts = total_parts(source.len());
+            // Resume a matching interrupted upload of this very chunk.
+            let resume = index
+                .journal_get(chunk_hash)?
+                .filter(|&(_, journal_total, _)| journal_total == parts)
+                .map(|(file_id, _, done)| (file_id, done));
             let name = format!("{}.bin", &chunk_hash[..16]);
             let caption = format!("{} [{}/{total}]", file.rel_path, seq + 1);
             println!("  ↑ {caption} ({chunk_len} bytes)");
             let msg_id = tg
-                .upload_document(peer, &mut stream, chunk_len as usize, name, &caption)
+                .upload_source(peer, source, name, &caption, resume, |file_id, done| {
+                    if done == 0 {
+                        index.journal_start(chunk_hash, file_id, parts)
+                    } else {
+                        index.journal_progress(chunk_hash, done)
+                    }
+                })
                 .await?;
+            index.journal_clear(chunk_hash)?;
             index.insert_chunk(&ChunkEntry {
                 hash: chunk_hash.clone(),
                 size: chunk_len,
                 msg_id,
+                encrypted: crypto.is_some(),
             })?;
             uploaded_bytes += chunk_len;
         }
@@ -269,13 +360,19 @@ pub async fn sync(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Resul
     Ok(())
 }
 
-/// Serialize the index, compress it, upload it to the channel and pin it.
+/// Serialize the index, compress it (and seal it when the repo is
+/// encrypted), upload it to the channel and pin it.
 pub async fn snapshot(tg: &Tg, index: &Index, repo: &Repo) -> Result<()> {
     let peer = tg.peer(&repo.config)?;
     let dump = index.export()?;
     let json = serde_json::to_vec(&dump)?;
-    let compressed = zstd::encode_all(json.as_slice(), 9)?;
-    let name = format!("tgfs-index-v{}.json.zst", dump.version);
+    let mut compressed = zstd::encode_all(json.as_slice(), 9)?;
+    let mut name = format!("tgfs-index-v{}.json.zst", dump.version);
+    if let Some(crypto) = repo.crypto()? {
+        let context = *blake3::hash(&compressed).as_bytes();
+        compressed = crypto.seal_blob(&context, &compressed)?;
+        name.push_str(".enc");
+    }
     let caption = index_caption(
         dump.version,
         dump.files.len(),
@@ -320,6 +417,14 @@ pub async fn pull(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Resul
 
     let mut raw = Vec::new();
     tg.download_document(peer, remote.msg_id, &mut raw).await?;
+    if Crypto::is_sealed_blob(&raw) {
+        let crypto = repo.crypto()?.context(
+            "the remote index snapshot is encrypted but this repo has no \
+             encryption_key — add the repo's key to .tgfs/config.toml \
+             (see `tgfs key` on a machine that has it)",
+        )?;
+        raw = crypto.open_blob(&raw)?;
+    }
     let json = zstd::decode_all(raw.as_slice()).context("snapshot is not valid zstd")?;
     let snapshot: Snapshot =
         serde_json::from_slice(&json).context("snapshot is not a valid tgfs index")?;
@@ -366,6 +471,7 @@ pub async fn get(
             .collect::<Result<Vec<_>>>()?
     };
     let peer = tg.peer(&repo.config)?;
+    let crypto = repo.crypto()?;
 
     for file in targets {
         let out_path = dest.join(&file.path);
@@ -383,12 +489,23 @@ pub async fn get(
                 inner: &mut out,
                 hasher: &mut hasher,
             };
-            let n = tg.download_document(peer, chunk.msg_id, &mut writer).await?;
-            if n != chunk.size {
-                bail!(
-                    "chunk {chunk_hash}: downloaded {n} bytes, expected {}",
-                    chunk.size
-                );
+            let (n, expected) = if chunk.encrypted {
+                let crypto = crypto.as_ref().context(
+                    "chunk is encrypted but this repo has no encryption_key in \
+                     .tgfs/config.toml",
+                )?;
+                let mut decryptor =
+                    DecryptingWriter::new(&mut writer, crypto, chunk_hash.as_bytes(), chunk.size);
+                let n = tg
+                    .download_document(peer, chunk.msg_id, &mut decryptor)
+                    .await?;
+                (n, Crypto::sealed_len(chunk.size))
+            } else {
+                let n = tg.download_document(peer, chunk.msg_id, &mut writer).await?;
+                (n, chunk.size)
+            };
+            if n != expected {
+                bail!("chunk {chunk_hash}: downloaded {n} bytes, expected {expected}");
             }
         }
         let actual = hasher.finalize().to_hex().to_string();
@@ -446,6 +563,51 @@ mod tests {
         let (file_hash, chunks) = hash_file(&path, 4).unwrap();
         assert!(chunks.is_empty());
         assert_eq!(file_hash, blake3::hash(b"").to_hex().to_string());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn encrypted_source_roundtrips_through_decrypting_writer() {
+        use crate::crypto::SEGMENT_SIZE;
+        let path = std::env::temp_dir().join(format!("tgfs-enc-src-{}", std::process::id()));
+        // Chunk starting at a non-zero base, spanning >2 segments.
+        let base = 1000u64;
+        let plain_len = 2 * SEGMENT_SIZE + 4321;
+        let mut content = vec![0u8; (base + plain_len) as usize];
+        for (i, b) in content.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&path, &content).unwrap();
+
+        let crypto = Arc::new(Crypto::new(&[9u8; 32]));
+        let source = EncryptedChunkSource {
+            file: std::fs::File::open(&path).unwrap(),
+            base,
+            plain_len,
+            crypto: Arc::clone(&crypto),
+            context: "deadbeef".into(),
+        };
+        assert_eq!(source.len(), Crypto::sealed_len(plain_len));
+
+        // Read the sealed stream in odd-sized pieces, as the uploader would
+        // in 512 KiB parts (and simulate out-of-order part reads).
+        let mut sealed = vec![0u8; source.len() as usize];
+        let piece = 512 * 1024 + 7;
+        let mut offsets: Vec<usize> = (0..sealed.len()).step_by(piece).collect();
+        offsets.reverse();
+        for off in offsets {
+            let end = (off + piece).min(sealed.len());
+            source.read_at(off as u64, &mut sealed[off..end]).unwrap();
+        }
+
+        let mut out = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut w = DecryptingWriter::new(&mut out, &crypto, b"deadbeef", plain_len);
+            w.write_all(&sealed).unwrap();
+        }
+        assert_eq!(out, &content[base as usize..]);
 
         let _ = std::fs::remove_file(path);
     }

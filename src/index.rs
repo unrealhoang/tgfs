@@ -25,8 +25,12 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkEntry {
     pub hash: String,
+    /// Plaintext size; the uploaded document is larger when encrypted.
     pub size: u64,
     pub msg_id: i32,
+    /// Whether the uploaded document is sealed with the repo key.
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 /// Serialized form uploaded to Telegram as the remote index snapshot.
@@ -55,9 +59,10 @@ impl Index {
                  deleted INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS chunks (
-                 hash   TEXT PRIMARY KEY,
-                 size   INTEGER NOT NULL,
-                 msg_id INTEGER NOT NULL
+                 hash      TEXT PRIMARY KEY,
+                 size      INTEGER NOT NULL,
+                 msg_id    INTEGER NOT NULL,
+                 encrypted INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS file_chunks (
                  file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -74,6 +79,12 @@ impl Index {
              CREATE TABLE IF NOT EXISTS meta (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS upload_journal (
+                 chunk_hash  TEXT PRIMARY KEY,
+                 file_id     INTEGER NOT NULL,
+                 total_parts INTEGER NOT NULL,
+                 done_parts  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
         Ok(Self { conn })
@@ -119,13 +130,14 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT size, msg_id FROM chunks WHERE hash = ?1",
+                "SELECT size, msg_id, encrypted FROM chunks WHERE hash = ?1",
                 params![hash],
                 |r| {
                     Ok(ChunkEntry {
                         hash: hash.to_string(),
                         size: r.get(0)?,
                         msg_id: r.get(1)?,
+                        encrypted: r.get(2)?,
                     })
                 },
             )
@@ -134,8 +146,8 @@ impl Index {
 
     pub fn insert_chunk(&self, chunk: &ChunkEntry) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO chunks (hash, size, msg_id) VALUES (?1, ?2, ?3)",
-            params![chunk.hash, chunk.size, chunk.msg_id],
+            "INSERT OR REPLACE INTO chunks (hash, size, msg_id, encrypted) VALUES (?1, ?2, ?3, ?4)",
+            params![chunk.hash, chunk.size, chunk.msg_id, chunk.encrypted],
         )?;
         Ok(())
     }
@@ -250,14 +262,53 @@ impl Index {
         Ok(())
     }
 
+    /// In-progress big-file upload for `chunk_hash`, if any:
+    /// `(telegram_file_id, total_parts, done_parts)`. `done_parts` is the
+    /// contiguous prefix of parts confirmed by Telegram.
+    pub fn journal_get(&self, chunk_hash: &str) -> Result<Option<(i64, i32, i32)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT file_id, total_parts, done_parts FROM upload_journal WHERE chunk_hash = ?1",
+                params![chunk_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn journal_start(&self, chunk_hash: &str, file_id: i64, total_parts: i32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO upload_journal (chunk_hash, file_id, total_parts, done_parts)
+             VALUES (?1, ?2, ?3, 0)",
+            params![chunk_hash, file_id, total_parts],
+        )?;
+        Ok(())
+    }
+
+    pub fn journal_progress(&self, chunk_hash: &str, done_parts: i32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE upload_journal SET done_parts = ?2 WHERE chunk_hash = ?1",
+            params![chunk_hash, done_parts],
+        )?;
+        Ok(())
+    }
+
+    pub fn journal_clear(&self, chunk_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM upload_journal WHERE chunk_hash = ?1",
+            params![chunk_hash],
+        )?;
+        Ok(())
+    }
+
     /// Replace the local index contents with a remote snapshot (pull).
     pub fn import(&mut self, snapshot: &Snapshot) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute_batch("DELETE FROM file_chunks; DELETE FROM files; DELETE FROM chunks;")?;
         for chunk in &snapshot.chunks {
             tx.execute(
-                "INSERT INTO chunks (hash, size, msg_id) VALUES (?1, ?2, ?3)",
-                params![chunk.hash, chunk.size, chunk.msg_id],
+                "INSERT INTO chunks (hash, size, msg_id, encrypted) VALUES (?1, ?2, ?3, ?4)",
+                params![chunk.hash, chunk.size, chunk.msg_id, chunk.encrypted],
             )?;
         }
         for file in &snapshot.files {
@@ -293,13 +344,16 @@ impl Index {
         for f in self.list_files(None, true)? {
             files.push(self.get_file(&f.path)?.expect("file just listed"));
         }
-        let mut stmt = self.conn.prepare("SELECT hash, size, msg_id FROM chunks")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash, size, msg_id, encrypted FROM chunks")?;
         let chunks = stmt
             .query_map([], |r| {
                 Ok(ChunkEntry {
                     hash: r.get(0)?,
                     size: r.get(1)?,
                     msg_id: r.get(2)?,
+                    encrypted: r.get(3)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -343,6 +397,7 @@ mod tests {
                 hash: "aa".into(),
                 size: 10,
                 msg_id: 1,
+                encrypted: false,
             })
             .unwrap();
         index
@@ -350,6 +405,7 @@ mod tests {
                 hash: "bb".into(),
                 size: 5,
                 msg_id: 2,
+                encrypted: false,
             })
             .unwrap();
         let entry = FileEntry {
@@ -421,6 +477,7 @@ mod tests {
                 hash: "aa".into(),
                 size: 3,
                 msg_id: 7,
+                encrypted: true,
             })
             .unwrap();
         index
@@ -454,7 +511,9 @@ mod tests {
         assert!(other.get_file("stale.txt").unwrap().is_none());
         let restored = other.get_file("a.txt").unwrap().unwrap();
         assert_eq!(restored.chunks, vec!["aa".to_string()]);
-        assert_eq!(other.chunk("aa").unwrap().unwrap().msg_id, 7);
+        let chunk = other.chunk("aa").unwrap().unwrap();
+        assert_eq!(chunk.msg_id, 7);
+        assert!(chunk.encrypted);
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(other_path);

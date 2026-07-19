@@ -24,6 +24,10 @@ pub struct RepoConfig {
     pub channel_access_hash: i64,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: u64,
+    /// Base64 32-byte master key for client-side encryption. When set, new
+    /// chunks and index snapshots are encrypted before upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
 }
 
 /// A discovered tgfs repo: the folder being backed up plus its `.tgfs/`.
@@ -127,6 +131,19 @@ impl Repo {
 
     pub fn index_path(&self) -> PathBuf {
         self.root.join(REPO_DIR).join("index.db")
+    }
+
+    /// The repo's [`Crypto`] context, if encryption is configured.
+    pub fn crypto(&self) -> Result<Option<crate::crypto::Crypto>> {
+        self.config
+            .encryption_key
+            .as_deref()
+            .map(|s| {
+                let key = crate::crypto::Crypto::key_from_string(s)
+                    .context("invalid encryption_key in .tgfs/config.toml")?;
+                Ok(crate::crypto::Crypto::new(&key))
+            })
+            .transpose()
     }
 
     /// Channel title for this repo, derived from the folder name.

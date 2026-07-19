@@ -54,10 +54,22 @@ stable message IDs, and access control.
   The resulting `(message_id, file_reference)` pair is recorded in the index.
 - Chunk-level **deduplication**: a chunk whose hash is already in the index is
   not re-uploaded (renames and duplicate files cost nothing).
-- Uploads are resumable: part-level progress is journaled locally, so an
-  interrupted 2 GiB upload continues instead of restarting.
-- Optional (later): client-side encryption (age or XChaCha20-Poly1305) before
-  upload, since Telegram cloud chats are not E2E-encrypted.
+- Uploads are resumable at the part level: chunks above 10 MiB go through
+  Telegram's big-file path with 4 parallel 512 KiB part uploads; the
+  contiguous prefix of confirmed parts is journaled in the local index
+  (`upload_journal`), so an interrupted 2 GiB upload continues from where it
+  stopped instead of restarting.
+- Flood waits are handled by a client-wide retry policy: `FLOOD_WAIT_X` is
+  slept out (up to 30 minutes, as instructed by the server) and transient
+  I/O errors retry with exponential backoff.
+- Optional client-side encryption (`tgfs init --encrypt`), since Telegram
+  cloud chats are not E2E-encrypted: XChaCha20-Poly1305 over independent
+  1 MiB segments, with nonces derived (keyed BLAKE3) from the chunk's
+  plaintext hash and segment number. Deterministic ciphertext keeps dedup
+  and upload resume working; the per-repo key lives in `.tgfs/config.toml`
+  (`tgfs key` prints it, `tgfs clone --key` supplies it on a new machine).
+  Index snapshots are sealed with the same key. Sizes, chunk counts and
+  chunk equality remain visible — contents do not.
 
 ## 3. Where to store metadata
 
@@ -104,7 +116,7 @@ private channel, named `tgfs-<folder-name>`.
 
 ```
 tgfs login               # authenticate the Telegram account (once per machine)
-tgfs init                # in the folder to back up: create .tgfs/ + the channel
+tgfs init [--encrypt]    # in the folder to back up: create .tgfs/ + the channel
 tgfs status              # local changes vs index, and local vs remote version
 tgfs sync                # push new/changed files, tombstone deleted, pin snapshot
 tgfs pull                # import a newer remote index snapshot
@@ -112,7 +124,8 @@ tgfs ls [prefix]         # list indexed files
 tgfs get <path> [dest]   # restore a file or folder from the channel
 tgfs log                 # list index snapshots
 tgfs channels            # list this account's tgfs channels (repos to clone)
-tgfs clone <name> [dir]  # pull an existing channel's index into a new folder
+tgfs clone <name> [dir] [--key <k>]  # pull an existing channel into a new folder
+tgfs key                 # print this repo's encryption key
 ```
 
 - `tgfs sync` is idempotent and incremental (mtime+size fast path, hash to
@@ -144,6 +157,7 @@ Out of scope for v1, but the design keeps it possible:
       already-uploaded chunks are skipped on retry; part-level resume within a
       chunk is left to M4).
 - [x] **M3** — SQLite index, `sync`/`ls`/`get`, remote index snapshots.
-- [ ] **M4** — hardening: FLOOD_WAIT handling, parallel parts, part-level
-      resume, encryption, index restore from a pinned snapshot.
+- [x] **M4** — hardening: FLOOD_WAIT handling (client-wide retry policy),
+      parallel part uploads, part-level resume (journaled), client-side
+      encryption, index restore from a pinned snapshot (`pull`/`clone`).
 - [ ] **M5 (optional)** — read-only FUSE mount.

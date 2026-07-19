@@ -9,7 +9,7 @@ from anywhere inside that folder.
 
 ```
 tgfs login               # authenticate the Telegram account (once per machine)
-tgfs init                # in the folder to back up: create .tgfs/ + the channel
+tgfs init [--encrypt]    # in the folder to back up: create .tgfs/ + the channel
 tgfs status              # local changes vs index, and local vs remote version
 tgfs sync                # push new/changed files, tombstone deleted, pin snapshot
 tgfs pull                # import a newer remote index snapshot
@@ -18,6 +18,7 @@ tgfs get <path> [dest]   # restore a file or folder
 tgfs log                 # list index snapshots
 tgfs channels            # list this account's tgfs channels (repos to clone)
 tgfs clone <name> [dir]  # pull an existing channel's index into a new folder
+tgfs key                 # print this repo's encryption key
 ```
 
 Every sync pins a versioned index snapshot in the channel; `status`, `sync`

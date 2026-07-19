@@ -1,4 +1,5 @@
 mod config;
+mod crypto;
 mod index;
 mod sync;
 mod tg;
@@ -30,7 +31,11 @@ enum Command {
     /// Authenticate the Telegram account (once per machine)
     Login,
     /// Turn the current folder into a tgfs repo (creates .tgfs/ + channel)
-    Init,
+    Init {
+        /// Generate a client-side encryption key for this repo
+        #[arg(long)]
+        encrypt: bool,
+    },
     /// Show local changes and the local vs remote index version
     Status,
     /// Push new/changed files to Telegram and pin a new index snapshot
@@ -70,7 +75,12 @@ enum Command {
         name: String,
         /// Destination folder (defaults to the name without the tgfs- prefix)
         dir: Option<PathBuf>,
+        /// Encryption key of the repo (required if it was created with --encrypt)
+        #[arg(long)]
+        key: Option<String>,
     },
+    /// Print this repo's encryption key (keep it safe; needed to clone)
+    Key,
 }
 
 #[tokio::main]
@@ -79,7 +89,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Login => login().await,
-        Command::Init => init().await,
+        Command::Init { encrypt } => init(encrypt).await,
         Command::Status => {
             let (repo, index, tg) = open_repo().await?;
             sync::status(&tg, &index, &repo).await
@@ -106,7 +116,17 @@ async fn main() -> Result<()> {
             sync::get(&tg, &index, &repo, &path, dest).await
         }
         Command::Channels => channels().await,
-        Command::Clone { name, dir } => clone(&name, dir).await,
+        Command::Clone { name, dir, key } => clone(&name, dir, key).await,
+        Command::Key => {
+            let repo = Repo::discover(&std::env::current_dir()?)?;
+            match &repo.config.encryption_key {
+                Some(key) => {
+                    println!("{key}");
+                    Ok(())
+                }
+                None => bail!("this repo is not encrypted"),
+            }
+        }
         Command::Log => {
             let repo = Repo::discover(&std::env::current_dir()?)?;
             let index = Index::open(&repo.index_path())?;
@@ -139,7 +159,7 @@ async fn login() -> Result<()> {
     Ok(())
 }
 
-async fn init() -> Result<()> {
+async fn init(encrypt: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     if let Ok(repo) = Repo::discover(&cwd) {
         bail!(
@@ -150,6 +170,14 @@ async fn init() -> Result<()> {
     let global = GlobalConfig::load()?;
     let tg = connect_authorized(&global).await?;
 
+    let encryption_key = if encrypt {
+        let key = crypto::Crypto::key_to_string(&crypto::Crypto::generate_key());
+        println!("generated encryption key: {key}");
+        println!("KEEP IT SAFE: without it, encrypted backups cannot be restored");
+        Some(key)
+    } else {
+        None
+    };
     let title = Repo::channel_title(&cwd)?;
     let (channel_id, channel_access_hash, existed) = tg.ensure_channel(&title).await?;
     let repo = Repo::create(
@@ -158,6 +186,7 @@ async fn init() -> Result<()> {
             channel_id,
             channel_access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
+            encryption_key,
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -198,7 +227,7 @@ async fn channels() -> Result<()> {
 }
 
 /// Adopt an existing channel into a fresh folder and pull its index.
-async fn clone(name: &str, dir: Option<PathBuf>) -> Result<()> {
+async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<()> {
     let title = if name.starts_with("tgfs-") {
         name.to_string()
     } else {
@@ -217,6 +246,10 @@ async fn clone(name: &str, dir: Option<PathBuf>) -> Result<()> {
         .await?
         .with_context(|| format!("no channel titled {title:?} — see `tgfs channels`"))?;
 
+    // Validate a provided key before writing it into the repo config.
+    if let Some(k) = &key {
+        crypto::Crypto::key_from_string(k)?;
+    }
     std::fs::create_dir_all(&dest)?;
     let repo = Repo::create(
         &dest,
@@ -224,6 +257,7 @@ async fn clone(name: &str, dir: Option<PathBuf>) -> Result<()> {
             channel_id: channel.id,
             channel_access_hash: channel.access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
+            encryption_key: key,
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;

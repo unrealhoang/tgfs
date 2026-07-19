@@ -15,6 +15,7 @@ use grammers_session::types::{
 };
 use grammers_session::{BoxFuture, Session, SessionData};
 use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite_from_row::FromRow;
 
 const VERSION: i64 = 1;
 
@@ -27,6 +28,37 @@ const GIGAGROUP: i64 = MEGAGROUP | BROADCAST;
 struct Cache {
     home_dc: i32,
     dc_options: HashMap<i32, DcOption>,
+}
+
+#[derive(FromRow)]
+struct DcOptionRow {
+    #[from_row(rename = "dc_id")]
+    id: i32,
+    ipv4: String,
+    ipv6: String,
+    auth_key: Option<Vec<u8>>,
+}
+
+#[derive(FromRow)]
+struct PeerRow {
+    peer_id: i64,
+    hash: Option<i64>,
+    subtype: Option<i64>,
+}
+
+#[derive(FromRow)]
+struct UpdatesStateRow {
+    pts: i32,
+    qts: i32,
+    date: i32,
+    seq: i32,
+}
+
+#[derive(FromRow)]
+struct ChannelStateRow {
+    #[from_row(rename = "peer_id")]
+    id: i64,
+    pts: i32,
 }
 
 /// A file-backed grammers session using tgfs's existing SQLite dependency.
@@ -101,10 +133,12 @@ impl FileSession {
         {
             let mut statement =
                 connection.prepare("SELECT dc_id, ipv4, ipv6, auth_key FROM dc_option")?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
+            let rows = statement
+                .query_map([], DcOptionRow::try_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            for row in rows {
                 let auth_key = row
-                    .get::<_, Option<Vec<u8>>>(3)?
+                    .auth_key
                     .map(|key| {
                         let length = key.len();
                         key.try_into()
@@ -112,9 +146,9 @@ impl FileSession {
                     })
                     .transpose()?;
                 let option = DcOption {
-                    id: row.get(0)?,
-                    ipv4: row.get::<_, String>(1)?.parse()?,
-                    ipv6: row.get::<_, String>(2)?.parse()?,
+                    id: row.id,
+                    ipv4: row.ipv4.parse()?,
+                    ipv6: row.ipv6.parse()?,
                     auth_key,
                 };
                 dc_options.insert(option.id, option);
@@ -183,18 +217,17 @@ impl FileSession {
         peer: PeerId,
     ) -> Result<Option<PeerInfo>, FileSessionError> {
         let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<PeerInfo> {
-            let stored_id: i64 = row.get(0)?;
-            let auth = row.get::<_, Option<i64>>(1)?.map(PeerAuth::from_hash);
-            let subtype = row.get::<_, Option<i64>>(2)?;
+            let row = PeerRow::try_from_row(row)?;
+            let auth = row.hash.map(PeerAuth::from_hash);
             Ok(match peer.kind() {
                 PeerKind::User => PeerInfo::User {
-                    id: PeerId::from_bot_api_dialog_id(stored_id)
+                    id: PeerId::from_bot_api_dialog_id(row.peer_id)
                         .expect("stored peer ID was validated when cached")
                         .bare_id()
                         .expect("stored peer cannot be the self sentinel"),
                     auth,
-                    bot: subtype.map(|value| value & USER_BOT != 0),
-                    is_self: subtype.map(|value| value & USER_SELF != 0),
+                    bot: row.subtype.map(|value| value & USER_BOT != 0),
+                    is_self: row.subtype.map(|value| value & USER_SELF != 0),
                 },
                 PeerKind::Chat => PeerInfo::Chat {
                     id: peer.bare_id().expect("chat peer has a bare ID"),
@@ -202,7 +235,7 @@ impl FileSession {
                 PeerKind::Channel => PeerInfo::Channel {
                     id: peer.bare_id().expect("channel peer has a bare ID"),
                     auth,
-                    kind: subtype.and_then(|value| {
+                    kind: row.subtype.and_then(|value| {
                         if value & GIGAGROUP == GIGAGROUP {
                             Some(ChannelKind::Gigagroup)
                         } else if value & BROADCAST != 0 {
@@ -341,11 +374,12 @@ impl Session for FileSession {
                     "SELECT pts, qts, date, seq FROM update_state LIMIT 1",
                     [],
                     |row| {
+                        let row = UpdatesStateRow::try_from_row(row)?;
                         Ok(UpdatesState {
-                            pts: row.get(0)?,
-                            qts: row.get(1)?,
-                            date: row.get(2)?,
-                            seq: row.get(3)?,
+                            pts: row.pts,
+                            qts: row.qts,
+                            date: row.date,
+                            seq: row.seq,
                             channels: Vec::new(),
                         })
                     },
@@ -354,12 +388,13 @@ impl Session for FileSession {
                 .unwrap_or_default();
             let mut statement = connection.prepare("SELECT peer_id, pts FROM channel_state")?;
             state.channels = statement
-                .query_map([], |row| {
-                    Ok(ChannelState {
-                        id: row.get(0)?,
-                        pts: row.get(1)?,
+                .query_map([], ChannelStateRow::try_from_row)?
+                .map(|row| {
+                    row.map(|row| ChannelState {
+                        id: row.id,
+                        pts: row.pts,
                     })
-                })?
+                })
                 .collect::<Result<_, _>>()?;
             Ok(state)
         })

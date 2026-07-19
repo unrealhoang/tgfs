@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite_from_row::FromRow;
 use serde::{Deserialize, Serialize};
 
 pub struct Index {
@@ -22,7 +23,7 @@ pub struct FileEntry {
     pub chunks: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ChunkEntry {
     pub hash: String,
     /// Plaintext size; the uploaded document is larger when encrypted.
@@ -31,6 +32,29 @@ pub struct ChunkEntry {
     /// Whether the uploaded document is sealed with the repo key.
     #[serde(default)]
     pub encrypted: bool,
+}
+
+#[derive(FromRow)]
+struct FileRow {
+    id: i64,
+    path: String,
+    size: u64,
+    mtime: i64,
+    hash: String,
+    deleted: bool,
+}
+
+impl FileRow {
+    fn into_entry(self, chunks: Vec<String>) -> FileEntry {
+        FileEntry {
+            path: self.path,
+            size: self.size,
+            mtime: self.mtime,
+            hash: self.hash,
+            deleted: self.deleted,
+            chunks,
+        }
+    }
 }
 
 /// Serialized form uploaded to Telegram as the remote index snapshot.
@@ -94,52 +118,30 @@ impl Index {
         let row = self
             .conn
             .query_row(
-                "SELECT id, size, mtime, hash, deleted FROM files WHERE path = ?1",
+                "SELECT id, path, size, mtime, hash, deleted FROM files WHERE path = ?1",
                 params![path],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, u64>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, bool>(4)?,
-                    ))
-                },
+                FileRow::try_from_row,
             )
             .optional()?;
-        let Some((id, size, mtime, hash, deleted)) = row else {
+        let Some(row) = row else {
             return Ok(None);
         };
         let mut stmt = self
             .conn
             .prepare("SELECT chunk_hash FROM file_chunks WHERE file_id = ?1 ORDER BY seq")?;
         let chunks = stmt
-            .query_map(params![id], |r| r.get::<_, String>(0))?
+            .query_map(params![row.id], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(Some(FileEntry {
-            path: path.to_string(),
-            size,
-            mtime,
-            hash,
-            deleted,
-            chunks,
-        }))
+        Ok(Some(row.into_entry(chunks)))
     }
 
     pub fn chunk(&self, hash: &str) -> Result<Option<ChunkEntry>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT size, msg_id, encrypted FROM chunks WHERE hash = ?1",
+                "SELECT hash, size, msg_id, encrypted FROM chunks WHERE hash = ?1",
                 params![hash],
-                |r| {
-                    Ok(ChunkEntry {
-                        hash: hash.to_string(),
-                        size: r.get(0)?,
-                        msg_id: r.get(1)?,
-                        encrypted: r.get(2)?,
-                    })
-                },
+                ChunkEntry::try_from_row,
             )
             .optional()?)
     }
@@ -201,23 +203,22 @@ impl Index {
         Ok(count)
     }
 
-    pub fn list_files(&self, prefix: Option<&str>, include_deleted: bool) -> Result<Vec<FileEntry>> {
+    pub fn list_files(
+        &self,
+        prefix: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<Vec<FileEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, size, mtime, hash, deleted FROM files
+            "SELECT id, path, size, mtime, hash, deleted FROM files
              WHERE path LIKE ?1 || '%' AND (deleted = 0 OR ?2)
              ORDER BY path",
         )?;
         let rows = stmt
-            .query_map(params![prefix.unwrap_or(""), include_deleted], |r| {
-                Ok(FileEntry {
-                    path: r.get(0)?,
-                    size: r.get(1)?,
-                    mtime: r.get(2)?,
-                    hash: r.get(3)?,
-                    deleted: r.get(4)?,
-                    chunks: Vec::new(),
-                })
-            })?
+            .query_map(
+                params![prefix.unwrap_or(""), include_deleted],
+                FileRow::try_from_row,
+            )?
+            .map(|row| row.map(|row| row.into_entry(Vec::new())))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -348,14 +349,7 @@ impl Index {
             .conn
             .prepare("SELECT hash, size, msg_id, encrypted FROM chunks")?;
         let chunks = stmt
-            .query_map([], |r| {
-                Ok(ChunkEntry {
-                    hash: r.get(0)?,
-                    size: r.get(1)?,
-                    msg_id: r.get(2)?,
-                    encrypted: r.get(3)?,
-                })
-            })?
+            .query_map([], ChunkEntry::try_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Snapshot {
             format: 1,

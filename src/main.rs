@@ -142,6 +142,9 @@ enum Command {
         /// Enable client-side encryption for this repo
         #[arg(long)]
         encrypt: bool,
+        /// Do not pack small files into shared documents (see PACKING.md)
+        #[arg(long)]
+        no_pack: bool,
         #[command(flatten)]
         key: KeyArgs,
     },
@@ -220,7 +223,11 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Login => login().await,
         Command::Genkey { path } => generate_keyfile(&path),
-        Command::Init { encrypt, key } => init(encrypt, key.load()?).await,
+        Command::Init {
+            encrypt,
+            no_pack,
+            key,
+        } => init(encrypt, no_pack, key.load()?).await,
         Command::Status => {
             let (repo, index, tg) = open_repo().await?;
             sync::status(&tg, &index, &repo).await
@@ -325,7 +332,7 @@ fn generate_keyfile(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-async fn init(encrypt: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
+async fn init(encrypt: bool, no_pack: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     if let Ok(repo) = Repo::discover(&cwd) {
         bail!(
@@ -374,6 +381,10 @@ async fn init(encrypt: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
             chunk_size: config::DEFAULT_CHUNK_SIZE,
             encrypted: encrypt || remote_encrypted,
             key_verifier: effective_key.map(crypto::Crypto::key_verifier),
+            pack: config::PackConfig {
+                enabled: !no_pack,
+                ..Default::default()
+            },
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -451,6 +462,10 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<[u8; 32]>) -> Resul
             chunk_size: config::DEFAULT_CHUNK_SIZE,
             encrypted,
             key_verifier: key.as_ref().map(crypto::Crypto::key_verifier),
+            pack: config::PackConfig {
+                enabled: true,
+                ..Default::default()
+            },
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -600,6 +615,7 @@ mod cli_tests {
                 chunk_size: config::DEFAULT_CHUNK_SIZE,
                 encrypted,
                 key_verifier: verifier,
+                pack: config::PackConfig::default(),
             },
         }
     }

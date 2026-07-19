@@ -78,6 +78,175 @@ impl PartSource for EncryptedChunkSource {
     }
 }
 
+/// Stored (on-remote) length of a `plain_len`-byte chunk: the plaintext
+/// length, or the sealed length when the repo is encrypted.
+fn stored_len(plain_len: u64, crypto: &Option<Arc<Crypto>>) -> u64 {
+    match crypto {
+        Some(_) => Crypto::sealed_len(plain_len),
+        None => plain_len,
+    }
+}
+
+/// Build the [`PartSource`] for one chunk's stored bytes: plaintext, or
+/// per-chunk sealed with `chunk_hash` as the nonce context. `base` is the
+/// chunk's byte offset within the file (0 for a packed small file).
+fn chunk_source(
+    abs_path: &Path,
+    base: u64,
+    plain_len: u64,
+    chunk_hash: &str,
+    crypto: &Option<Arc<Crypto>>,
+) -> Result<Arc<dyn PartSource>> {
+    let file = std::fs::File::open(abs_path)?;
+    Ok(match crypto {
+        Some(c) => Arc::new(EncryptedChunkSource {
+            file,
+            base,
+            plain_len,
+            crypto: Arc::clone(c),
+            context: chunk_hash.to_string(),
+        }),
+        None => Arc::new(PlainChunkSource {
+            file,
+            base,
+            len: plain_len,
+        }),
+    })
+}
+
+/// One member of a pack: its stored bytes and where they sit in the pack.
+struct PackMember {
+    source: Arc<dyn PartSource>,
+    stored_offset: u64,
+    stored_len: u64,
+}
+
+/// A [`PartSource`] over the concatenated stored bytes of several members.
+/// Members are kept in ascending `stored_offset` order, so a read at any
+/// offset resolves to the covering member by binary search and delegates.
+struct PackSource {
+    members: Vec<PackMember>,
+    total: u64,
+}
+
+impl PartSource for PackSource {
+    fn len(&self) -> u64 {
+        self.total
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let mut filled = 0usize;
+        let mut pos = offset;
+        while filled < buf.len() {
+            let idx = self
+                .members
+                .partition_point(|m| m.stored_offset + m.stored_len <= pos);
+            let member = self
+                .members
+                .get(idx)
+                .context("pack read past end of members")?;
+            let in_member = pos - member.stored_offset;
+            let take = ((member.stored_len - in_member) as usize).min(buf.len() - filled);
+            member
+                .source
+                .read_at(in_member, &mut buf[filled..filled + take])?;
+            filled += take;
+            pos += take as u64;
+        }
+        Ok(())
+    }
+}
+
+/// A small file queued for packing: exactly one chunk, deferred so several
+/// such files can share one uploaded document (see PACKING.md).
+struct PackItem {
+    rel_path: String,
+    abs_path: PathBuf,
+    mtime: i64,
+    size: u64,
+    file_hash: String,
+    chunk_hash: String,
+}
+
+/// Upload `pending` as one packed document, then record its member chunks
+/// (shared `msg_id`, ascending offsets) and finally upsert the member files.
+/// The ordering (upload → chunks → files) mirrors the standalone path so a
+/// crash never leaves a file referencing an unstored chunk.
+async fn flush_pack(
+    tg: &Tg,
+    index: &mut Index,
+    peer: grammers_client::session::types::PeerRef,
+    crypto: &Option<Arc<Crypto>>,
+    pending: &[PackItem],
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let mut members = Vec::with_capacity(pending.len());
+    let mut offsets = Vec::with_capacity(pending.len());
+    let mut stored_offset = 0u64;
+    // Name the pack deterministically by its member chunk hashes, so an
+    // interrupted upload resumes only when rebuilt to the exact same pack.
+    let mut pack_hasher = blake3::Hasher::new();
+    for item in pending {
+        pack_hasher.update(item.chunk_hash.as_bytes());
+        let member_len = stored_len(item.size, crypto);
+        let source = chunk_source(&item.abs_path, 0, item.size, &item.chunk_hash, crypto)?;
+        offsets.push(stored_offset);
+        members.push(PackMember {
+            source,
+            stored_offset,
+            stored_len: member_len,
+        });
+        stored_offset += member_len;
+    }
+    let total = stored_offset;
+    let pack_hash = pack_hasher.finalize().to_hex().to_string();
+    let source: Arc<dyn PartSource> = Arc::new(PackSource { members, total });
+
+    let parts = total_parts(total);
+    let resume = index
+        .journal_get(&pack_hash)?
+        .filter(|&(_, journal_total, _)| journal_total == parts)
+        .map(|(file_id, _, done)| (file_id, done));
+    let name = format!("pack-{}.bin", &pack_hash[..16]);
+    let caption = format!("pack files={} bytes={total}", pending.len());
+    println!("  ↑ {caption}");
+    let msg_id = tg
+        .upload_source(peer, source, name, &caption, resume, |file_id, done| {
+            if done == 0 {
+                index.journal_start(&pack_hash, file_id, parts)
+            } else {
+                index.journal_progress(&pack_hash, done)
+            }
+        })
+        .await?;
+    index.journal_clear(&pack_hash)?;
+
+    for (item, offset) in pending.iter().zip(offsets) {
+        index.insert_chunk(&ChunkEntry {
+            hash: item.chunk_hash.clone(),
+            size: item.size,
+            msg_id,
+            offset,
+            encrypted: crypto.is_some(),
+        })?;
+    }
+    for item in pending {
+        index.upsert_file(&FileEntry {
+            path: item.rel_path.clone(),
+            size: item.size,
+            mtime: item.mtime,
+            hash: item.file_hash.clone(),
+            deleted: false,
+            chunks: vec![item.chunk_hash.clone()],
+        })?;
+        println!("✓ {}", item.rel_path);
+    }
+    Ok(())
+}
+
 /// Hash a file, returning the whole-file hash and the hash of every
 /// `chunk_size`-sized chunk (streaming; nothing is held in memory).
 fn hash_file(path: &Path, chunk_size: u64) -> Result<(String, Vec<String>)> {
@@ -282,6 +451,10 @@ pub async fn push(
     let mut uploaded_bytes = 0u64;
     let mut skipped = 0usize;
 
+    let pack = &repo.config.pack;
+    let mut pending: Vec<PackItem> = Vec::new();
+    let mut pending_stored = 0u64;
+
     for file in walk_repo(repo)? {
         alive.push(file.rel_path.clone());
 
@@ -296,6 +469,50 @@ pub async fn push(
         }
 
         let (file_hash, chunk_hashes) = hash_file(&file.abs_path, repo.config.chunk_size)?;
+
+        // Packable: a small, non-empty file is exactly one chunk (threshold
+        // never exceeds chunk_size). Defer it into a pack instead of spending
+        // a whole message on it. Empty files carry no chunks and fall through
+        // to be recorded below.
+        if pack.enabled && file.size > 0 && file.size < pack.threshold {
+            let chunk_hash = chunk_hashes[0].clone();
+            if index.chunk(&chunk_hash)?.is_some() {
+                // Dedup: identical content already stored — record the file
+                // now (its chunk exists) without queueing anything.
+                index.upsert_file(&FileEntry {
+                    path: file.rel_path.clone(),
+                    size: file.size,
+                    mtime: file.mtime,
+                    hash: file_hash,
+                    deleted: false,
+                    chunks: vec![chunk_hash],
+                })?;
+                uploaded_files += 1;
+                println!("✓ {}", file.rel_path);
+                continue;
+            }
+            let member_len = stored_len(file.size, &crypto);
+            if !pending.is_empty() && pending_stored + member_len > pack.target_size {
+                for item in &pending {
+                    uploaded_bytes += item.size;
+                }
+                uploaded_files += pending.len();
+                flush_pack(tg, index, peer, &crypto, &pending).await?;
+                pending.clear();
+                pending_stored = 0;
+            }
+            pending.push(PackItem {
+                rel_path: file.rel_path.clone(),
+                abs_path: file.abs_path.clone(),
+                mtime: file.mtime,
+                size: file.size,
+                file_hash,
+                chunk_hash,
+            });
+            pending_stored += member_len;
+            continue;
+        }
+
         let total = chunk_hashes.len();
         for (seq, chunk_hash) in chunk_hashes.iter().enumerate() {
             if index.chunk(chunk_hash)?.is_some() {
@@ -303,21 +520,7 @@ pub async fn push(
             }
             let offset = seq as u64 * repo.config.chunk_size;
             let chunk_len = (file.size - offset).min(repo.config.chunk_size);
-            let opened = std::fs::File::open(&file.abs_path)?;
-            let source: Arc<dyn PartSource> = match &crypto {
-                Some(c) => Arc::new(EncryptedChunkSource {
-                    file: opened,
-                    base: offset,
-                    plain_len: chunk_len,
-                    crypto: Arc::clone(c),
-                    context: chunk_hash.clone(),
-                }),
-                None => Arc::new(PlainChunkSource {
-                    file: opened,
-                    base: offset,
-                    len: chunk_len,
-                }),
-            };
+            let source = chunk_source(&file.abs_path, offset, chunk_len, chunk_hash, &crypto)?;
             let parts = total_parts(source.len());
             // Resume a matching interrupted upload of this very chunk.
             let resume = index
@@ -341,6 +544,7 @@ pub async fn push(
                 hash: chunk_hash.clone(),
                 size: chunk_len,
                 msg_id,
+                offset: 0,
                 encrypted: crypto.is_some(),
             })?;
             uploaded_bytes += chunk_len;
@@ -355,6 +559,16 @@ pub async fn push(
         })?;
         uploaded_files += 1;
         println!("✓ {}", file.rel_path);
+    }
+
+    // Flush the final partial pack.
+    if !pending.is_empty() {
+        for item in &pending {
+            uploaded_bytes += item.size;
+        }
+        uploaded_files += pending.len();
+        flush_pack(tg, index, peer, &crypto, &pending).await?;
+        pending.clear();
     }
 
     let tombstoned = index.tombstone_missing("", &alive)?;
@@ -447,6 +661,14 @@ pub fn import_snapshot(index: &mut Index, plain: &[u8], remote: RemoteIndexInfo)
     let json = zstd::decode_all(plain).context("snapshot is not valid zstd")?;
     let snapshot: Snapshot =
         serde_json::from_slice(&json).context("snapshot is not a valid tgfs index")?;
+    if snapshot.format > crate::index::SNAPSHOT_FORMAT {
+        bail!(
+            "remote snapshot is format {} but this tgfs understands up to {} — \
+             upgrade tgfs to read this repo (see PACKING.md)",
+            snapshot.format,
+            crate::index::SNAPSHOT_FORMAT
+        );
+    }
     if snapshot.version != remote.version {
         bail!(
             "pinned caption says v{} but snapshot contains v{} — refusing to import",
@@ -509,18 +731,24 @@ pub async fn get(
                 inner: &mut out,
                 hasher: &mut hasher,
             };
+            // A packed chunk shares its message with others, so read exactly
+            // its stored byte range; standalone chunks (offset 0 filling the
+            // whole document) are just the degenerate case of the same read.
             let (n, expected) = if chunk.encrypted {
                 let crypto = crypto
                     .as_ref()
                     .context("chunk is encrypted; supply --key or --keyfile")?;
                 let mut decryptor =
                     DecryptingWriter::new(&mut writer, crypto, chunk_hash.as_bytes(), chunk.size);
+                let expected = Crypto::sealed_len(chunk.size);
                 let n = tg
-                    .download_document(peer, chunk.msg_id, &mut decryptor)
+                    .download_range(peer, chunk.msg_id, chunk.offset, expected, &mut decryptor)
                     .await?;
-                (n, Crypto::sealed_len(chunk.size))
+                (n, expected)
             } else {
-                let n = tg.download_document(peer, chunk.msg_id, &mut writer).await?;
+                let n = tg
+                    .download_range(peer, chunk.msg_id, chunk.offset, chunk.size, &mut writer)
+                    .await?;
                 (n, chunk.size)
             };
             if n != expected {
@@ -629,6 +857,109 @@ mod tests {
         assert_eq!(out, &content[base as usize..]);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pack_source_concatenates_members_across_boundaries() {
+        let dir = std::env::temp_dir().join(format!("tgfs-pack-src-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Three small "files" of different sizes.
+        let contents: [&[u8]; 3] = [b"alpha", b"the-second-file-body", b"z"];
+        let mut members = Vec::new();
+        let mut offsets = Vec::new();
+        let mut stored_offset = 0u64;
+        let mut expected = Vec::new();
+        for (i, body) in contents.iter().enumerate() {
+            let path = dir.join(format!("m{i}"));
+            std::fs::write(&path, body).unwrap();
+            let len = body.len() as u64;
+            let source = chunk_source(&path, 0, len, &format!("h{i}"), &None).unwrap();
+            offsets.push(stored_offset);
+            members.push(PackMember {
+                source,
+                stored_offset,
+                stored_len: len,
+            });
+            stored_offset += len;
+            expected.extend_from_slice(body);
+        }
+        let total = stored_offset;
+        let pack = PackSource { members, total };
+        assert_eq!(pack.len(), total);
+
+        // Whole pack in one read.
+        let mut whole = vec![0u8; total as usize];
+        pack.read_at(0, &mut whole).unwrap();
+        assert_eq!(whole, expected);
+
+        // Every sub-range, including reads that straddle member boundaries.
+        for start in 0..total {
+            for end in (start + 1)..=total {
+                let mut got = vec![0u8; (end - start) as usize];
+                pack.read_at(start, &mut got).unwrap();
+                assert_eq!(got, &expected[start as usize..end as usize]);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pack_source_encrypted_member_offsets_match_index() {
+        use crate::crypto::SEGMENT_SIZE;
+        let dir = std::env::temp_dir().join(format!("tgfs-pack-enc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let crypto: Option<Arc<Crypto>> = Some(Arc::new(Crypto::new(&[5u8; 32])));
+
+        // A member spanning >1 segment, then a tiny one, so stored offsets
+        // include the per-segment tag overhead.
+        let sizes = [SEGMENT_SIZE + 123, 7u64];
+        let mut members = Vec::new();
+        let mut stored_offset = 0u64;
+        let mut plaintext: Vec<Vec<u8>> = Vec::new();
+        for (i, &size) in sizes.iter().enumerate() {
+            let body: Vec<u8> = (0..size as usize).map(|b| (b % 251) as u8).collect();
+            let path = dir.join(format!("m{i}"));
+            std::fs::write(&path, &body).unwrap();
+            let ctx = format!("ctx{i}");
+            let len = stored_len(size, &crypto);
+            let source = chunk_source(&path, 0, size, &ctx, &crypto).unwrap();
+            members.push((PackMember {
+                source,
+                stored_offset,
+                stored_len: len,
+            }, ctx, body));
+            stored_offset += len;
+        }
+        let total = stored_offset;
+        let contexts: Vec<_> = members.iter().map(|(_, c, _)| c.clone()).collect();
+        let plains: Vec<_> = members.iter().map(|(_, _, b)| b.clone()).collect();
+        let offsets: Vec<_> = members.iter().map(|(m, _, _)| m.stored_offset).collect();
+        plaintext.extend(plains);
+        let pack = PackSource {
+            members: members.into_iter().map(|(m, _, _)| m).collect(),
+            total,
+        };
+
+        // Read each member's sealed range straight out of the pack, then
+        // decrypt with its own context — exactly what `get` does per chunk.
+        for (i, &off) in offsets.iter().enumerate() {
+            let sealed_len = stored_len(sizes[i], &crypto);
+            let mut sealed = vec![0u8; sealed_len as usize];
+            pack.read_at(off, &mut sealed).unwrap();
+            let mut out = Vec::new();
+            {
+                use std::io::Write as _;
+                let mut w = DecryptingWriter::new(
+                    &mut out,
+                    crypto.as_ref().unwrap(),
+                    contexts[i].as_bytes(),
+                    sizes[i],
+                );
+                w.write_all(&sealed).unwrap();
+            }
+            assert_eq!(out, plaintext[i]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

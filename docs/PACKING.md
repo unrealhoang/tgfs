@@ -124,20 +124,15 @@ Snapshot `format` bumps `1 → 2` when any chunk has a nonzero offset
 know** — a format-1-only client silently ignoring `offset` would
 download the whole pack and fail the length/hash check with a confusing
 error; an explicit "snapshot format 2 requires a newer tgfs" is the
-correct failure. Writers keep emitting `format: 1` while the repo
-contains no packed chunks, so merely upgrading the binary breaks
-nothing for other machines.
+correct failure (`import_snapshot` enforces this). Writers keep emitting
+`format: 1` while the repo contains no packed chunks, so merely
+upgrading the binary breaks nothing for other machines.
 
-New journal table for pack-upload resume (§7):
-
-```sql
-CREATE TABLE pack_journal (
-    pack_hash  TEXT NOT NULL,   -- hash naming the in-flight pack
-    seq        INTEGER NOT NULL,
-    chunk_hash TEXT NOT NULL,   -- member, in concatenation order
-    PRIMARY KEY (pack_hash, seq)
-);
-```
+Pack-upload resume reuses the existing `upload_journal` table (which
+already maps a hash to `(telegram file_id, total_parts, done_parts)`),
+keyed by the *pack hash* instead of a chunk hash. No new table is
+needed: the member order is reconstructed deterministically from the
+sorted walk (§7), so there is nothing extra to persist.
 
 ## 5. Push pipeline
 
@@ -156,9 +151,10 @@ once more at the end of the walk for the remainder. A flush:
 1. Fixes the member order (walk order — deterministic because the walk
    is sorted) and computes each member's stored offset:
    `offset[i+1] = offset[i] + stored_len(size[i])`.
-2. Journals the member list into `pack_journal` under a *pack hash* —
-   BLAKE3 of the concatenated member chunk hashes. This names the pack
-   deterministically without reading file bytes twice.
+2. Names the pack by a *pack hash* — BLAKE3 of the concatenated member
+   chunk hashes — and records the in-flight upload under `upload_journal`
+   keyed by that hash. This names the pack deterministically without
+   reading file bytes twice.
 3. Uploads via the existing resumable uploader with a new
    `PackSource: PartSource` that maps a read at stored offset `o` to
    the member covering `o` and delegates to the existing
@@ -197,12 +193,14 @@ before writing to `out`. Worst-case waste is < 4 KiB + one trailing
 partial block per member — irrelevant at these sizes.
 
 `get` then changes in one place: instead of downloading `chunk.msg_id`
-whole, it downloads `stored_len(chunk.size)` bytes at `chunk.offset`.
-For `offset == 0` standalone chunks it may keep using the whole-message
-path (equivalent, and avoids raw-API alignment handling in the common
-case). Decryption, the length check, and the whole-file hash check are
+whole, every chunk read goes through `download_range`, fetching
+`stored_len(chunk.size)` bytes at `chunk.offset`. A standalone chunk is
+just the degenerate case (`offset 0`, length == the whole document), so
+one code path covers both and the index never needs to record document
+sizes. Decryption, the length check, and the whole-file hash check are
 untouched — `DecryptingWriter` already consumes exactly the sealed
-member stream.
+member stream. (Whole-document reads without a known length — the index
+snapshots — keep using the streaming `download_document`.)
 
 Restoring a whole packed *directory* naturally issues one ranged read
 per file against the same message; an easy later optimization is
@@ -211,17 +209,18 @@ into one ranged read, but it is not required for correctness.
 
 ## 7. Resume & failure model
 
-- **Interrupted pack upload**: `upload_journal` already records
+- **Interrupted pack upload**: `upload_journal` records
   `(hash → telegram file_id, total_parts, done_parts)`; packs use it
-  keyed by the pack hash. On the next push, the builder re-collects
-  small-file chunks; before flushing, it checks `pack_journal` for an
-  in-flight pack whose member set is still fully pending (every member
-  absent from `chunks`, every member file unchanged — same chunk hash).
-  If so it rebuilds *that exact* member order and resumes the part
-  upload; deterministic per-member ciphertext guarantees identical
-  bytes. If any member changed or was already uploaded elsewhere, both
-  journal entries for the pack are dropped and packing starts fresh —
-  correctness never depends on resume.
+  keyed by the pack hash. On the next push, files that completed earlier
+  are skipped (fast-path or dedup), so the builder re-collects exactly
+  the same still-pending small files in the same sorted-walk order and
+  rebuilds the identical pack — same members, same pack hash. If
+  `upload_journal` holds an entry for that pack hash with a matching part
+  count, the part upload resumes from `done_parts`; deterministic
+  per-member ciphertext guarantees identical bytes. If the pending set
+  differs (a member changed, was added, or already landed elsewhere) the
+  pack hash differs, no journal entry matches, and packing simply starts
+  fresh — correctness never depends on resume.
 - **Crash after upload, before index insert**: the pack message is
   orphaned in the channel; the next push re-uploads. Same exposure as
   today's per-chunk path, just bigger; bounded by `target_size`, and
@@ -261,8 +260,12 @@ extensions, both out of scope here:
 
 ## 10. Milestone
 
-- **M6 — packing**: `[pack]` config + validation, `offset` column &
-  snapshot format 2 (with reader-side format guard shipped first),
-  `PackSource` + pack builder in push, `download_range` in get,
-  `pack_journal` resume. Format guard and `offset`-aware reading can
-  ship one release ahead of the writer, easing fleet upgrades.
+- **M6 — packing** (implemented): `[pack]` config + validation, the
+  `offset` column with an on-open migration, snapshot format 2 with a
+  reader-side guard, `PackSource` + the pack builder in push,
+  `download_range` in get, and pack-upload resume via `upload_journal`.
+  `tgfs init` enables packing by default (`--no-pack` opts out); repos
+  that predate the feature default to disabled. The format guard and
+  `offset`-aware reading are what let this ship safely to a fleet: a
+  reader only needs the new binary once a writer actually starts
+  packing.

@@ -28,10 +28,20 @@ pub struct ChunkEntry {
     /// Plaintext size; the uploaded document is larger when encrypted.
     pub size: u64,
     pub msg_id: i32,
+    /// Byte offset of this chunk's stored (possibly sealed) bytes within its
+    /// document. 0 for a standalone chunk; nonzero when the chunk shares a
+    /// packed message with others (see PACKING.md).
+    #[serde(default)]
+    pub offset: u64,
     /// Whether the uploaded document is sealed with the repo key.
     #[serde(default)]
     pub encrypted: bool,
 }
+
+/// Snapshot format understood by this build. Format 2 adds packed chunks
+/// (`ChunkEntry::offset`); a snapshot from a newer, unknown format is
+/// refused rather than misread (see [`Snapshot`] and PACKING.md).
+pub const SNAPSHOT_FORMAT: u32 = 2;
 
 /// Serialized form uploaded to Telegram as the remote index snapshot.
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,6 +72,7 @@ impl Index {
                  hash      TEXT PRIMARY KEY,
                  size      INTEGER NOT NULL,
                  msg_id    INTEGER NOT NULL,
+                 offset    INTEGER NOT NULL DEFAULT 0,
                  encrypted INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS file_chunks (
@@ -87,7 +98,24 @@ impl Index {
                  done_parts  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
-        Ok(Self { conn })
+        let index = Self { conn };
+        index.migrate()?;
+        Ok(index)
+    }
+
+    /// Bring an index created by an older tgfs up to the current schema.
+    /// Existing standalone chunks are all at offset 0, so the column default
+    /// is already correct for them.
+    fn migrate(&self) -> Result<()> {
+        let has_offset = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('chunks') WHERE name = 'offset'")?
+            .exists([])?;
+        if !has_offset {
+            self.conn
+                .execute_batch("ALTER TABLE chunks ADD COLUMN offset INTEGER NOT NULL DEFAULT 0")?;
+        }
+        Ok(())
     }
 
     pub fn get_file(&self, path: &str) -> Result<Option<FileEntry>> {
@@ -130,14 +158,15 @@ impl Index {
         Ok(self
             .conn
             .query_row(
-                "SELECT size, msg_id, encrypted FROM chunks WHERE hash = ?1",
+                "SELECT size, msg_id, offset, encrypted FROM chunks WHERE hash = ?1",
                 params![hash],
                 |r| {
                     Ok(ChunkEntry {
                         hash: hash.to_string(),
                         size: r.get(0)?,
                         msg_id: r.get(1)?,
-                        encrypted: r.get(2)?,
+                        offset: r.get(2)?,
+                        encrypted: r.get(3)?,
                     })
                 },
             )
@@ -146,8 +175,15 @@ impl Index {
 
     pub fn insert_chunk(&self, chunk: &ChunkEntry) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO chunks (hash, size, msg_id, encrypted) VALUES (?1, ?2, ?3, ?4)",
-            params![chunk.hash, chunk.size, chunk.msg_id, chunk.encrypted],
+            "INSERT OR REPLACE INTO chunks (hash, size, msg_id, offset, encrypted)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                chunk.hash,
+                chunk.size,
+                chunk.msg_id,
+                chunk.offset,
+                chunk.encrypted
+            ],
         )?;
         Ok(())
     }
@@ -307,8 +343,15 @@ impl Index {
         tx.execute_batch("DELETE FROM file_chunks; DELETE FROM files; DELETE FROM chunks;")?;
         for chunk in &snapshot.chunks {
             tx.execute(
-                "INSERT INTO chunks (hash, size, msg_id, encrypted) VALUES (?1, ?2, ?3, ?4)",
-                params![chunk.hash, chunk.size, chunk.msg_id, chunk.encrypted],
+                "INSERT INTO chunks (hash, size, msg_id, offset, encrypted)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    chunk.hash,
+                    chunk.size,
+                    chunk.msg_id,
+                    chunk.offset,
+                    chunk.encrypted
+                ],
             )?;
         }
         for file in &snapshot.files {
@@ -346,19 +389,28 @@ impl Index {
         }
         let mut stmt = self
             .conn
-            .prepare("SELECT hash, size, msg_id, encrypted FROM chunks")?;
+            .prepare("SELECT hash, size, msg_id, offset, encrypted FROM chunks")?;
         let chunks = stmt
             .query_map([], |r| {
                 Ok(ChunkEntry {
                     hash: r.get(0)?,
                     size: r.get(1)?,
                     msg_id: r.get(2)?,
-                    encrypted: r.get(3)?,
+                    offset: r.get(3)?,
+                    encrypted: r.get(4)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // Stay backward-compatible: only advertise format 2 once a packed
+        // chunk actually exists, so merely upgrading the binary doesn't lock
+        // out other machines still reading with an older tgfs.
+        let format = if chunks.iter().any(|c| c.offset != 0) {
+            2
+        } else {
+            1
+        };
         Ok(Snapshot {
-            format: 1,
+            format,
             version: self.version()?,
             created_at: now_unix(),
             files,
@@ -397,6 +449,7 @@ mod tests {
                 hash: "aa".into(),
                 size: 10,
                 msg_id: 1,
+                offset: 0,
                 encrypted: false,
             })
             .unwrap();
@@ -405,6 +458,7 @@ mod tests {
                 hash: "bb".into(),
                 size: 5,
                 msg_id: 2,
+                offset: 0,
                 encrypted: false,
             })
             .unwrap();
@@ -477,6 +531,7 @@ mod tests {
                 hash: "aa".into(),
                 size: 3,
                 msg_id: 7,
+                offset: 0,
                 encrypted: true,
             })
             .unwrap();
@@ -517,5 +572,64 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(other_path);
+    }
+
+    #[test]
+    fn packed_chunks_bump_format_and_roundtrip_offset() {
+        let (index, path) = temp_index();
+        // Two members sharing one message at distinct offsets.
+        index
+            .insert_chunk(&ChunkEntry {
+                hash: "m0".into(),
+                size: 100,
+                msg_id: 5,
+                offset: 0,
+                encrypted: false,
+            })
+            .unwrap();
+        index
+            .insert_chunk(&ChunkEntry {
+                hash: "m1".into(),
+                size: 40,
+                msg_id: 5,
+                offset: 100,
+                encrypted: false,
+            })
+            .unwrap();
+
+        let got = index.chunk("m1").unwrap().unwrap();
+        assert_eq!(got.offset, 100);
+        assert_eq!(got.msg_id, 5);
+
+        // A packed chunk (nonzero offset) advertises snapshot format 2.
+        let snapshot = index.export().unwrap();
+        assert_eq!(snapshot.format, 2);
+
+        // Import into a fresh index preserves the shared message + offsets.
+        let (mut other, other_path) = temp_index();
+        other.import(&snapshot).unwrap();
+        let a = other.chunk("m0").unwrap().unwrap();
+        let b = other.chunk("m1").unwrap().unwrap();
+        assert_eq!((a.msg_id, a.offset), (5, 0));
+        assert_eq!((b.msg_id, b.offset), (5, 100));
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(other_path);
+    }
+
+    #[test]
+    fn export_stays_format_1_without_packing() {
+        let (index, path) = temp_index();
+        index
+            .insert_chunk(&ChunkEntry {
+                hash: "aa".into(),
+                size: 10,
+                msg_id: 1,
+                offset: 0,
+                encrypted: false,
+            })
+            .unwrap();
+        assert_eq!(index.export().unwrap().format, 1);
+        let _ = std::fs::remove_file(path);
     }
 }

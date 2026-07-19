@@ -403,6 +403,102 @@ impl Tg {
         Ok(total)
     }
 
+    /// Stream `len` bytes starting at byte `offset` of the document in
+    /// message `msg_id` into `out`, returning the number of bytes written.
+    /// Used to read one packed chunk out of a shared document (see
+    /// PACKING.md). Telegram's `upload.getFile` wants 4 KiB-aligned offsets
+    /// and limits, so we request 4 KiB-aligned windows (with `precise` to
+    /// lift the 1 MiB-boundary restriction) and discard the sub-block slack.
+    pub async fn download_range<W: std::io::Write>(
+        &self,
+        peer: PeerRef,
+        msg_id: i32,
+        offset: u64,
+        len: u64,
+        out: &mut W,
+    ) -> Result<u64> {
+        use grammers_client::media::Downloadable;
+
+        const ALIGN: u64 = 4 * 1024;
+        /// Max bytes per `getFile` request; a multiple of `ALIGN` and within
+        /// Telegram's 1 MiB limit.
+        const MAX_REQUEST: u64 = 1024 * 1024;
+
+        if len == 0 {
+            return Ok(0);
+        }
+        let msgs = self.client.get_messages_by_id(peer, &[msg_id]).await?;
+        let msg = msgs
+            .into_iter()
+            .next()
+            .flatten()
+            .with_context(|| format!("message {msg_id} not found in storage channel"))?;
+        let media = msg
+            .media()
+            .with_context(|| format!("message {msg_id} has no media"))?;
+        let doc = match media {
+            Media::Document(doc) => doc,
+            other => bail!("message {msg_id} is not a document: {other:?}"),
+        };
+        let location = doc
+            .to_raw_input_location()
+            .with_context(|| format!("message {msg_id} document has no downloadable location"))?;
+
+        let mut written = 0u64;
+        let mut pos = offset - (offset % ALIGN); // 4 KiB-aligned request offset
+        let mut discard = (offset - pos) as usize; // leading slack to drop
+        let mut remaining = len;
+        while remaining > 0 {
+            let need = discard as u64 + remaining;
+            let limit = need.min(MAX_REQUEST).next_multiple_of(ALIGN);
+            let bytes = self.get_file(&location, pos as i64, limit as i32).await?;
+            if bytes.len() <= discard {
+                bail!("ranged download of message {msg_id} returned short read");
+            }
+            let avail = &bytes[discard..];
+            let take = avail.len().min(remaining as usize);
+            out.write_all(&avail[..take])?;
+            written += take as u64;
+            remaining -= take as u64;
+            pos += limit;
+            discard = 0;
+            if (bytes.len() as u64) < limit {
+                break; // reached end of document
+            }
+        }
+        Ok(written)
+    }
+
+    /// One `upload.getFile` call, retrying on a file-DC migration.
+    async fn get_file(
+        &self,
+        location: &tl::enums::InputFileLocation,
+        offset: i64,
+        limit: i32,
+    ) -> Result<Vec<u8>> {
+        use tl::enums::upload::File;
+        let request = tl::functions::upload::GetFile {
+            precise: true,
+            cdn_supported: false,
+            location: location.clone(),
+            offset,
+            limit,
+        };
+        let result = match self.client.invoke(&request).await {
+            Err(grammers_client::InvocationError::Rpc(err)) if err.code == 303 => {
+                // FILE_MIGRATE_X: the document lives on another data center.
+                let dc = err.value.context("file migrate error without a target DC")?;
+                self.client.invoke_in_dc(dc as i32, &request).await
+            }
+            other => other,
+        }
+        .context("upload.getFile failed")?;
+        match result {
+            File::File(f) => Ok(f.bytes),
+            File::CdnRedirect(_) => bail!("unexpected CDN redirect for storage document"),
+        }
+    }
+
     pub async fn pin(&self, peer: PeerRef, msg_id: i32) -> Result<()> {
         self.client
             .pin_message(peer, msg_id)

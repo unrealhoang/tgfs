@@ -8,6 +8,17 @@ pub const REPO_DIR: &str = ".tgfs";
 /// 1 GiB — well under the 2 GiB per-file cap, large enough to keep
 /// message count low.
 pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
+/// Files smaller than this are candidates for packing (see PACKING.md).
+/// 8 MiB clears most "many small files" workloads while keeping the
+/// per-member ranged-download slack negligible.
+pub const DEFAULT_PACK_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// A pack is flushed once its stored size reaches this. 256 MiB keeps a
+/// failed pack's re-upload exposure bounded and stays far from the cap
+/// even after encryption overhead.
+pub const DEFAULT_PACK_TARGET_SIZE: u64 = 256 * 1024 * 1024;
+/// Telegram's per-document size cap (non-premium). A pack's *stored*
+/// (possibly sealed) size must fit under this.
+pub const MAX_DOCUMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Per-machine account credentials (`~/.config/tgfs/config.toml`).
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +44,73 @@ pub struct RepoConfig {
     /// persist and lets commands reject an incorrect supplied key locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_verifier: Option<String>,
+    /// Small-file packing settings (see PACKING.md). Absent in configs that
+    /// predate the feature, which default to packing disabled.
+    #[serde(default)]
+    pub pack: PackConfig,
+}
+
+/// Controls packing many small files into one uploaded document. Members
+/// stay individually content-addressed and encrypted; only their storage
+/// location (one shared message, distinct offsets) changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackConfig {
+    /// Off by default so upgrading a binary never changes an existing repo's
+    /// on-remote layout; `tgfs init` writes `true` for new repos.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Files strictly smaller than this are packed; larger ones take the
+    /// normal one-message-per-chunk path.
+    #[serde(default = "default_pack_threshold")]
+    pub threshold: u64,
+    /// A pack is flushed once its accumulated stored size reaches this.
+    #[serde(default = "default_pack_target_size")]
+    pub target_size: u64,
+}
+
+impl Default for PackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_pack_threshold(),
+            target_size: default_pack_target_size(),
+        }
+    }
+}
+
+impl PackConfig {
+    /// Reject nonsensical settings before they can corrupt a push.
+    pub fn validate(&self, chunk_size: u64) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.threshold == 0 {
+            bail!("pack.threshold must be greater than zero");
+        }
+        if self.threshold > chunk_size {
+            bail!(
+                "pack.threshold ({}) must not exceed chunk_size ({chunk_size}) — \
+                 a packed file is single-chunk by definition",
+                self.threshold
+            );
+        }
+        if self.target_size < self.threshold {
+            bail!(
+                "pack.target_size ({}) must be at least pack.threshold ({})",
+                self.target_size,
+                self.threshold
+            );
+        }
+        // The sealed pack must still fit under Telegram's per-document cap.
+        if crate::crypto::Crypto::sealed_len(self.target_size) > MAX_DOCUMENT_SIZE {
+            bail!(
+                "pack.target_size ({}) is too large: its sealed size exceeds the \
+                 {MAX_DOCUMENT_SIZE}-byte per-document cap",
+                self.target_size
+            );
+        }
+        Ok(())
+    }
 }
 
 /// A discovered tgfs repo: the folder being backed up plus its `.tgfs/`.
@@ -43,6 +121,14 @@ pub struct Repo {
 
 fn default_chunk_size() -> u64 {
     DEFAULT_CHUNK_SIZE
+}
+
+fn default_pack_threshold() -> u64 {
+    DEFAULT_PACK_THRESHOLD
+}
+
+fn default_pack_target_size() -> u64 {
+    DEFAULT_PACK_TARGET_SIZE
 }
 
 pub fn global_config_path() -> Result<PathBuf> {
@@ -120,6 +206,10 @@ impl Repo {
                 let raw = std::fs::read_to_string(&config_path)
                     .with_context(|| format!("cannot read {}", config_path.display()))?;
                 let config: RepoConfig = toml::from_str(&raw)
+                    .with_context(|| format!("invalid config at {}", config_path.display()))?;
+                config
+                    .pack
+                    .validate(config.chunk_size)
                     .with_context(|| format!("invalid config at {}", config_path.display()))?;
                 return Ok(Self {
                     root: dir.to_path_buf(),

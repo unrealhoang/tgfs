@@ -1,5 +1,7 @@
 mod config;
 mod crypto;
+mod diff;
+mod file;
 mod index;
 mod session;
 mod sync;
@@ -222,8 +224,8 @@ async fn main() -> Result<()> {
         Command::Genkey { path } => generate_keyfile(&path),
         Command::Init { encrypt, key } => init(encrypt, key.load()?).await,
         Command::Status => {
-            let (repo, index, tg) = open_repo().await?;
-            sync::status(&tg, &index, &repo).await
+            let (repo, mut index, tg) = open_repo().await?;
+            sync::SyncEngine::new(&tg, &mut index, &repo).status().await
         }
         Command::Push { force, key } => {
             let key = key.load()?;
@@ -231,13 +233,17 @@ async fn main() -> Result<()> {
             if configure_repo_encryption(&mut repo, key.as_ref())? {
                 repo.save_config()?;
             }
-            sync::push(&tg, &mut index, &repo, force, key.as_ref()).await
+            sync::SyncEngine::new(&tg, &mut index, &repo)
+                .push(force, key.as_ref())
+                .await
         }
         Command::Pull { force, key } => {
             let key = key.load()?;
             let (mut repo, mut index, tg) = open_repo().await?;
             let config_changed = configure_repo_encryption(&mut repo, key.as_ref())?;
-            let remote_encrypted = sync::pull(&tg, &mut index, &repo, force, key.as_ref()).await?;
+            let remote_encrypted = sync::SyncEngine::new(&tg, &mut index, &repo)
+                .pull(force, key.as_ref())
+                .await?;
             if remote_encrypted && !repo.config.encrypted {
                 repo.config.encrypted = true;
             }
@@ -257,9 +263,11 @@ async fn main() -> Result<()> {
         }
         Command::Get { path, dest, key } => {
             let key = key.load()?;
-            let (mut repo, index, tg) = open_repo().await?;
+            let (mut repo, mut index, tg) = open_repo().await?;
             let config_changed = configure_repo_encryption(&mut repo, key.as_ref())?;
-            sync::get(&tg, &index, &repo, &path, dest, key.as_ref()).await?;
+            sync::SyncEngine::new(&tg, &mut index, &repo)
+                .get(&path, dest, key.as_ref())
+                .await?;
             if config_changed {
                 repo.save_config()?;
             }

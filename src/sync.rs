@@ -33,7 +33,7 @@ impl PartSource for PlainChunkSource {
         use std::os::unix::fs::FileExt;
         self.file
             .read_exact_at(buf, self.base + offset)
-            .context("chunk read failed (file changed during sync?)")
+            .context("chunk read failed (file changed during push?)")
     }
 }
 
@@ -68,7 +68,7 @@ impl PartSource for EncryptedChunkSource {
             let mut plain = vec![0u8; plain_take];
             self.file
                 .read_exact_at(&mut plain, self.base + plain_off)
-                .context("chunk read failed (file changed during sync?)")?;
+                .context("chunk read failed (file changed during push?)")?;
             let sealed = self.crypto.seal_segment(self.context.as_bytes(), seg, &plain)?;
             let take = (sealed.len() - in_seg).min(buf.len() - written);
             buf[written..written + take].copy_from_slice(&sealed[in_seg..in_seg + take]);
@@ -162,7 +162,7 @@ impl VersionState {
             ),
             VersionState::Ahead(l, r) => format!(
                 "index AHEAD of remote (local v{l}, remote v{r}) — \
-                 a previous sync may not have finished; `tgfs sync` will re-publish"
+                 a previous push may not have finished; `tgfs push` will re-publish"
             ),
         }
     }
@@ -238,7 +238,7 @@ pub async fn status(tg: &Tg, index: &Index, repo: &Repo) -> Result<()> {
         println!("  deleted:  {path}");
     }
     println!(
-        "{} new, {} modified, {} deleted, {} unchanged — run `tgfs sync` to push",
+        "{} new, {} modified, {} deleted, {} unchanged — run `tgfs push` to upload",
         changes.new.len(),
         changes.modified.len(),
         changes.deleted.len(),
@@ -247,10 +247,19 @@ pub async fn status(tg: &Tg, index: &Index, repo: &Repo) -> Result<()> {
     Ok(())
 }
 
-/// One-way sync of the repo into its channel, guarded by the version check.
-pub async fn sync(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Result<()> {
+/// Push the repo into its channel, guarded by the version check.
+pub async fn push(
+    tg: &Tg,
+    index: &mut Index,
+    repo: &Repo,
+    force: bool,
+    key: Option<&[u8; 32]>,
+) -> Result<()> {
     let peer = tg.peer(&repo.config)?;
-    let crypto = repo.crypto()?.map(Arc::new);
+    let crypto = key.map(Crypto::new).map(Arc::new);
+    if repo.config.encrypted && crypto.is_none() {
+        bail!("this repo is encrypted; supply --key or --keyfile");
+    }
 
     let local_version = index.version()?;
     let remote = tg.remote_index_info(peer).await?;
@@ -351,24 +360,24 @@ pub async fn sync(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Resul
     let tombstoned = index.tombstone_missing("", &alive)?;
 
     println!(
-        "sync done: {uploaded_files} uploaded ({uploaded_bytes} bytes), \
+        "push done: {uploaded_files} uploaded ({uploaded_bytes} bytes), \
          {skipped} unchanged, {tombstoned} tombstoned"
     );
 
     index.set_version(next_version)?;
-    snapshot(tg, index, repo).await?;
+    snapshot(tg, index, repo, crypto.as_deref()).await?;
     Ok(())
 }
 
 /// Serialize the index, compress it (and seal it when the repo is
 /// encrypted), upload it to the channel and pin it.
-pub async fn snapshot(tg: &Tg, index: &Index, repo: &Repo) -> Result<()> {
+pub async fn snapshot(tg: &Tg, index: &Index, repo: &Repo, crypto: Option<&Crypto>) -> Result<()> {
     let peer = tg.peer(&repo.config)?;
     let dump = index.export()?;
     let json = serde_json::to_vec(&dump)?;
     let mut compressed = zstd::encode_all(json.as_slice(), 9)?;
     let mut name = format!("tgfs-index-v{}.json.zst", dump.version);
-    if let Some(crypto) = repo.crypto()? {
+    if let Some(crypto) = crypto {
         let context = *blake3::hash(&compressed).as_bytes();
         compressed = crypto.seal_blob(&context, &compressed)?;
         name.push_str(".enc");
@@ -394,17 +403,23 @@ pub async fn snapshot(tg: &Tg, index: &Index, repo: &Repo) -> Result<()> {
 }
 
 /// Download the pinned remote snapshot and replace the local index with it.
-pub async fn pull(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Result<()> {
+pub async fn pull(
+    tg: &Tg,
+    index: &mut Index,
+    repo: &Repo,
+    force: bool,
+    key: Option<&[u8; 32]>,
+) -> Result<bool> {
     let peer = tg.peer(&repo.config)?;
     let local_version = index.version()?;
     let Some(remote) = tg.remote_index_info(peer).await? else {
         println!("no remote index snapshot to pull");
-        return Ok(());
+        return Ok(false);
     };
     match VersionState::of(local_version, Some(remote)) {
         VersionState::UpToDate(v) => {
             println!("already up to date (v{v})");
-            return Ok(());
+            return Ok(repo.config.encrypted);
         }
         VersionState::Ahead(l, r) if !force => {
             bail!(
@@ -417,16 +432,13 @@ pub async fn pull(tg: &Tg, index: &mut Index, repo: &Repo, force: bool) -> Resul
 
     let mut raw = Vec::new();
     tg.download_document(peer, remote.msg_id, &mut raw).await?;
-    if Crypto::is_sealed_blob(&raw) {
-        let crypto = repo.crypto()?.context(
-            "the remote index snapshot is encrypted but this repo has no \
-             encryption_key — add the repo's key to .tgfs/config.toml \
-             (see `tgfs key` on a machine that has it)",
-        )?;
-        raw = crypto.open_blob(&raw)?;
+    let encrypted = Crypto::is_sealed_blob(&raw);
+    if encrypted {
+        let key = key.context("the remote snapshot is encrypted; supply --key or --keyfile")?;
+        raw = Crypto::new(key).open_blob(&raw)?;
     }
     import_snapshot(index, &raw, remote)?;
-    Ok(())
+    Ok(encrypted)
 }
 
 /// Decode a downloaded (already decrypted) snapshot, verify it matches the
@@ -462,6 +474,7 @@ pub async fn get(
     repo: &Repo,
     remote: &str,
     dest: Option<PathBuf>,
+    key: Option<&[u8; 32]>,
 ) -> Result<()> {
     let dest = dest.unwrap_or_else(|| repo.root.clone());
     let targets = if let Some(file) = index.get_file(remote)?.filter(|f| !f.deleted) {
@@ -478,7 +491,7 @@ pub async fn get(
             .collect::<Result<Vec<_>>>()?
     };
     let peer = tg.peer(&repo.config)?;
-    let crypto = repo.crypto()?;
+    let crypto = key.map(Crypto::new);
 
     for file in targets {
         let out_path = dest.join(&file.path);
@@ -497,10 +510,9 @@ pub async fn get(
                 hasher: &mut hasher,
             };
             let (n, expected) = if chunk.encrypted {
-                let crypto = crypto.as_ref().context(
-                    "chunk is encrypted but this repo has no encryption_key in \
-                     .tgfs/config.toml",
-                )?;
+                let crypto = crypto
+                    .as_ref()
+                    .context("chunk is encrypted; supply --key or --keyfile")?;
                 let mut decryptor =
                     DecryptingWriter::new(&mut writer, crypto, chunk_hash.as_bytes(), chunk.size);
                 let n = tg

@@ -5,14 +5,14 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use grammers_client::session::Session as _;
-use grammers_client::session::storages::SqliteSession;
-use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_client::message::InputMessage;
+use grammers_client::session::Session as _;
+use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_client::{Client, SenderPool, SignInError, media::Media, tl};
 use tokio::io::AsyncRead;
 
 use crate::config::{RepoConfig, session_path};
+use crate::session::FileSession;
 
 /// Telegram upload part size. Must be a power of two ≤ 512 KiB.
 pub const PART_SIZE: u64 = 512 * 1024;
@@ -79,15 +79,14 @@ pub fn total_parts(len: u64) -> i32 {
 
 pub struct Tg {
     pub client: Client,
-    session: Arc<SqliteSession>,
+    session: Arc<FileSession>,
 }
 
 impl Tg {
     /// Connect using the stored session. Does not log in by itself.
     pub async fn connect(api_id: i32) -> Result<Self> {
         let session = Arc::new(
-            SqliteSession::open(session_path()?)
-                .await
+            FileSession::open(session_path()?)
                 .map_err(|e| anyhow::anyhow!("cannot open session store: {e}"))?,
         );
         let pool = SenderPool::new(Arc::clone(&session), api_id);
@@ -523,12 +522,19 @@ impl Tg {
     /// (`tgfs-index v<N> ...`) without downloading the snapshot itself.
     /// `None` means the channel has no pinned tgfs-index yet.
     pub async fn remote_index_info(&self, peer: PeerRef) -> Result<Option<RemoteIndexInfo>> {
-        let Some(msg) = self
-            .client
-            .get_pinned_message(peer)
-            .await
-            .context("failed to fetch pinned message")?
-        else {
+        let pinned = match self.client.get_pinned_message(peer).await {
+            Ok(pinned) => pinned,
+            // Telegram returns this RPC error for InputMessage::Pinned when
+            // the channel has no pinned message. grammers currently exposes
+            // it as an error instead of the documented `None` result.
+            Err(grammers_client::InvocationError::Rpc(error))
+                if error.is("MESSAGE_IDS_EMPTY") =>
+            {
+                None
+            }
+            Err(error) => return Err(error).context("failed to fetch pinned message"),
+        };
+        let Some(msg) = pinned else {
             return Ok(None);
         };
         Ok(parse_index_caption(msg.text()).map(|version| RemoteIndexInfo {

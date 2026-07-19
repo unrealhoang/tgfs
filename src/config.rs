@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -24,10 +25,14 @@ pub struct RepoConfig {
     pub channel_access_hash: i64,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: u64,
-    /// Base64 32-byte master key for client-side encryption. When set, new
-    /// chunks and index snapshots are encrypted before upload.
+    /// Whether chunks and index snapshots are encrypted. The key itself is
+    /// never persisted and must be supplied to commands that need it.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Domain-separated verifier of the encryption key. This is safe to
+    /// persist and lets commands reject an incorrect supplied key locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encryption_key: Option<String>,
+    pub key_verifier: Option<String>,
 }
 
 /// A discovered tgfs repo: the folder being backed up plus its `.tgfs/`.
@@ -71,6 +76,23 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create a new secret file without ever replacing an existing path.
+pub fn write_new_private(path: &Path, contents: &str) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("cannot create key file {}", path.display()))?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 impl GlobalConfig {
     pub fn load() -> Result<Self> {
         let path = global_config_path()?;
@@ -97,7 +119,7 @@ impl Repo {
                 let config_path = marker.join("config.toml");
                 let raw = std::fs::read_to_string(&config_path)
                     .with_context(|| format!("cannot read {}", config_path.display()))?;
-                let config = toml::from_str(&raw)
+                let config: RepoConfig = toml::from_str(&raw)
                     .with_context(|| format!("invalid config at {}", config_path.display()))?;
                 return Ok(Self {
                     root: dir.to_path_buf(),
@@ -131,19 +153,6 @@ impl Repo {
 
     pub fn index_path(&self) -> PathBuf {
         self.root.join(REPO_DIR).join("index.db")
-    }
-
-    /// The repo's [`Crypto`] context, if encryption is configured.
-    pub fn crypto(&self) -> Result<Option<crate::crypto::Crypto>> {
-        self.config
-            .encryption_key
-            .as_deref()
-            .map(|s| {
-                let key = crate::crypto::Crypto::key_from_string(s)
-                    .context("invalid encryption_key in .tgfs/config.toml")?;
-                Ok(crate::crypto::Crypto::new(&key))
-            })
-            .transpose()
     }
 
     /// Channel title for this repo, derived from the folder name.

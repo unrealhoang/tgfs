@@ -9,25 +9,48 @@ from anywhere inside that folder.
 
 ```
 tgfs login               # authenticate the Telegram account (once per machine)
-tgfs init [--encrypt]    # in the folder to back up: create .tgfs/ + the channel
+tgfs genkey <path>       # create a new 0600 key file without overwriting
+tgfs init [--encrypt] [--key <k> | --keyfile <path>]
 tgfs status              # local changes vs index, and local vs remote version
-tgfs sync                # push new/changed files, tombstone deleted, pin snapshot
-tgfs pull                # import a newer remote index snapshot
+tgfs push [--key <k> | --keyfile <path>]
+tgfs pull [--key <k> | --keyfile <path>]
 tgfs ls [prefix]         # list indexed files
-tgfs get <path> [dest]   # restore a file or folder
+tgfs get <path> [dest] [--key <k> | --keyfile <path>]
 tgfs log                 # list index snapshots
 tgfs channels            # list this account's tgfs channels (repos to clone)
-tgfs clone <name> [dir]  # pull an existing channel's index into a new folder
-tgfs key                 # print this repo's encryption key
+tgfs clone <name> [dir] [--key <k> | --keyfile <path>]
 tgfs share <@user> [--write] | --link  # share this repo with another user
 tgfs members             # list who has access
 tgfs unshare <@user>     # remove access
 ```
 
-Every sync pins a versioned index snapshot in the channel; `status`, `sync`
+Every push pins a versioned index snapshot in the channel; `status`, `push`
 and `pull` compare the local index version against the pinned one, so two
 machines backing up the same folder detect each other's pushes instead of
 silently clobbering them.
+
+The advertised way to provide a key is through the environment, preferably
+with a keyfile:
+
+```sh
+tgfs genkey key.txt
+TGFS_KEYFILE=key.txt tgfs init --encrypt
+TGFS_KEYFILE=key.txt tgfs push
+TGFS_KEYFILE=key.txt tgfs pull
+TGFS_KEYFILE=key.txt tgfs get path/to/file
+```
+
+`TGFS_KEY` supplies the base64 key directly; `TGFS_KEYFILE` supplies a path.
+They are mutually exclusive and correspond to the `--key` and `--keyfile`
+flags, which remain available as alternatives. A key file contains the base64
+key printed by `init --encrypt` (surrounding whitespace is ignored). The secret
+is never saved in `.tgfs/config.toml`; the config stores only a
+domain-separated BLAKE3 verifier so a wrong key can be rejected locally.
+
+On `init`, any supplied key requires `--encrypt`; without one, `--encrypt`
+securely generates and prints a new key. On Unix, keyfiles with any group or
+other permissions are rejected; use `chmod 600 <path>` or create one with
+`genkey`.
 
 ### Building
 

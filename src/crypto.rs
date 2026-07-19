@@ -53,6 +53,20 @@ impl Crypto {
         base64::engine::general_purpose::STANDARD.encode(key)
     }
 
+    /// Public verifier used to reject an incorrect repository key without
+    /// persisting the key itself.
+    pub fn key_verifier(key: &[u8; 32]) -> String {
+        let verifier = blake3::derive_key("tgfs 2026 key verifier v1", key);
+        Self::key_to_string(&verifier)
+    }
+
+    pub fn key_matches_verifier(key: &[u8; 32], verifier: &str) -> Result<bool> {
+        let expected =
+            Self::key_from_string(verifier).context("invalid key_verifier in .tgfs/config.toml")?;
+        let actual = blake3::derive_key("tgfs 2026 key verifier v1", key);
+        Ok(actual == expected)
+    }
+
     pub fn key_from_string(s: &str) -> Result<[u8; 32]> {
         use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD
@@ -219,6 +233,15 @@ mod tests {
         assert_eq!(Crypto::key_from_string(&s).unwrap(), key);
         assert!(Crypto::key_from_string("not base64!!").is_err());
         assert!(Crypto::key_from_string("c2hvcnQ=").is_err()); // wrong length
+    }
+
+    #[test]
+    fn key_verifier_matches_only_its_key() {
+        let key = [3u8; 32];
+        let verifier = Crypto::key_verifier(&key);
+        assert!(Crypto::key_matches_verifier(&key, &verifier).unwrap());
+        assert!(!Crypto::key_matches_verifier(&[4u8; 32], &verifier).unwrap());
+        assert_ne!(verifier, Crypto::key_to_string(&key));
     }
 
     #[test]

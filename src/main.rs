@@ -1,14 +1,15 @@
 mod config;
 mod crypto;
 mod index;
+mod session;
 mod sync;
 mod tg;
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use config::{GlobalConfig, Repo, RepoConfig};
 use index::Index;
@@ -26,29 +27,141 @@ struct Cli {
     command: Command,
 }
 
+/// A repository encryption key supplied directly or read from a file.
+#[derive(Args)]
+struct KeyArgs {
+    /// Base64-encoded 32-byte repository encryption key
+    #[arg(
+        long,
+        env = "TGFS_KEY",
+        hide_env_values = true,
+        value_name = "KEY",
+        conflicts_with = "keyfile"
+    )]
+    key: Option<String>,
+    /// File containing the base64-encoded repository encryption key
+    #[arg(
+        long,
+        env = "TGFS_KEYFILE",
+        value_name = "PATH",
+        conflicts_with = "key"
+    )]
+    keyfile: Option<PathBuf>,
+}
+
+impl KeyArgs {
+    fn load(&self) -> Result<Option<[u8; 32]>> {
+        let (key, source) = match (&self.key, &self.keyfile) {
+            (Some(key), None) => (Some(key.clone()), "--key".to_string()),
+            (None, Some(path)) => (
+                Some(read_keyfile(path)?),
+                format!("key file {}", path.display()),
+            ),
+            (None, None) => (None, String::new()),
+            (Some(_), Some(_)) => unreachable!("clap rejects conflicting key sources"),
+        };
+        key.map(|key| {
+            crypto::Crypto::key_from_string(key.trim())
+                .with_context(|| format!("invalid encryption key from {source}"))
+        })
+        .transpose()
+    }
+}
+
+fn read_keyfile(path: &std::path::Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open key file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect key file {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("key file {} is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!(
+                "key file {} is accessible by group or others; run `chmod 600 {}`",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .with_context(|| format!("cannot read key file {}", path.display()))?;
+    Ok(contents)
+}
+
+/// Validate a supplied key against the repository's public verifier. Supplying
+/// a key to an unencrypted repository enables encryption and records only the
+/// verifier.
+fn configure_repo_encryption(repo: &mut Repo, key: Option<&[u8; 32]>) -> Result<bool> {
+    let Some(key) = key else {
+        if repo.config.encrypted {
+            bail!("this repo is encrypted; supply --key or --keyfile");
+        }
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    if !repo.config.encrypted {
+        repo.config.encrypted = true;
+        changed = true;
+    }
+    match repo.config.key_verifier.as_deref() {
+        Some(verifier) if !crypto::Crypto::key_matches_verifier(key, verifier)? => {
+            bail!("supplied encryption key does not match this repository")
+        }
+        Some(_) => {}
+        None => {
+            repo.config.key_verifier = Some(crypto::Crypto::key_verifier(key));
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Authenticate the Telegram account (once per machine)
     Login,
+    /// Generate a new encryption key file
+    Genkey {
+        /// Destination key file (must not already exist)
+        path: PathBuf,
+    },
     /// Turn the current folder into a tgfs repo (creates .tgfs/ + channel)
+    #[command(group(
+        clap::ArgGroup::new("init_key")
+            .args(["key", "keyfile"])
+            .requires("encrypt")
+    ))]
     Init {
-        /// Generate a client-side encryption key for this repo
+        /// Enable client-side encryption for this repo
         #[arg(long)]
         encrypt: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
     /// Show local changes and the local vs remote index version
     Status,
     /// Push new/changed files to Telegram and pin a new index snapshot
-    Sync {
+    Push {
         /// Push even if the remote index is newer (overwrites remote state)
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
     /// Import a newer remote index snapshot into the local index
     Pull {
         /// Pull even if the local index is newer (rolls back local state)
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        key: KeyArgs,
     },
     /// List files stored in the index
     Ls {
@@ -64,6 +177,8 @@ enum Command {
         path: String,
         /// Alternative destination directory (defaults to the repo root)
         dest: Option<PathBuf>,
+        #[command(flatten)]
+        key: KeyArgs,
     },
     /// List index snapshots known to this repo
     Log,
@@ -75,17 +190,14 @@ enum Command {
         name: String,
         /// Destination folder (defaults to the name without the tgfs- prefix)
         dir: Option<PathBuf>,
-        /// Encryption key of the repo (required if it was created with --encrypt)
-        #[arg(long)]
-        key: Option<String>,
+        #[command(flatten)]
+        key: KeyArgs,
     },
-    /// Print this repo's encryption key (keep it safe; needed to clone)
-    Key,
     /// Share this repo with another Telegram user
     Share {
         /// User to invite, e.g. @alice (omit when using --link)
         user: Option<String>,
-        /// Grant write access (post + pin admin rights, needed for sync)
+        /// Grant write access (post + pin admin rights, needed for push)
         #[arg(long)]
         write: bool,
         /// Create a read-only invite link instead of inviting a user
@@ -107,18 +219,32 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Login => login().await,
-        Command::Init { encrypt } => init(encrypt).await,
+        Command::Genkey { path } => generate_keyfile(&path),
+        Command::Init { encrypt, key } => init(encrypt, key.load()?).await,
         Command::Status => {
             let (repo, index, tg) = open_repo().await?;
             sync::status(&tg, &index, &repo).await
         }
-        Command::Sync { force } => {
-            let (repo, mut index, tg) = open_repo().await?;
-            sync::sync(&tg, &mut index, &repo, force).await
+        Command::Push { force, key } => {
+            let key = key.load()?;
+            let (mut repo, mut index, tg) = open_repo().await?;
+            if configure_repo_encryption(&mut repo, key.as_ref())? {
+                repo.save_config()?;
+            }
+            sync::push(&tg, &mut index, &repo, force, key.as_ref()).await
         }
-        Command::Pull { force } => {
-            let (repo, mut index, tg) = open_repo().await?;
-            sync::pull(&tg, &mut index, &repo, force).await
+        Command::Pull { force, key } => {
+            let key = key.load()?;
+            let (mut repo, mut index, tg) = open_repo().await?;
+            let config_changed = configure_repo_encryption(&mut repo, key.as_ref())?;
+            let remote_encrypted = sync::pull(&tg, &mut index, &repo, force, key.as_ref()).await?;
+            if remote_encrypted && !repo.config.encrypted {
+                repo.config.encrypted = true;
+            }
+            if config_changed || remote_encrypted {
+                repo.save_config()?;
+            }
+            Ok(())
         }
         Command::Ls { prefix, all } => {
             let repo = Repo::discover(&std::env::current_dir()?)?;
@@ -129,12 +255,18 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Get { path, dest } => {
-            let (repo, index, tg) = open_repo().await?;
-            sync::get(&tg, &index, &repo, &path, dest).await
+        Command::Get { path, dest, key } => {
+            let key = key.load()?;
+            let (mut repo, index, tg) = open_repo().await?;
+            let config_changed = configure_repo_encryption(&mut repo, key.as_ref())?;
+            sync::get(&tg, &index, &repo, &path, dest, key.as_ref()).await?;
+            if config_changed {
+                repo.save_config()?;
+            }
+            Ok(())
         }
         Command::Channels => channels().await,
-        Command::Clone { name, dir, key } => clone(&name, dir, key).await,
+        Command::Clone { name, dir, key } => clone(&name, dir, key.load()?).await,
         Command::Share { user, write, link } => share(user, write, link).await,
         Command::Members => {
             let (repo, _index, tg) = open_repo().await?;
@@ -152,16 +284,6 @@ async fn main() -> Result<()> {
             tg.remove_user(peer, target).await?;
             println!("removed {user} from this repo");
             Ok(())
-        }
-        Command::Key => {
-            let repo = Repo::discover(&std::env::current_dir()?)?;
-            match &repo.config.encryption_key {
-                Some(key) => {
-                    println!("{key}");
-                    Ok(())
-                }
-                None => bail!("this repo is not encrypted"),
-            }
         }
         Command::Log => {
             let repo = Repo::discover(&std::env::current_dir()?)?;
@@ -195,7 +317,15 @@ async fn login() -> Result<()> {
     Ok(())
 }
 
-async fn init(encrypt: bool) -> Result<()> {
+fn generate_keyfile(path: &std::path::Path) -> Result<()> {
+    let key = crypto::Crypto::generate_key();
+    let contents = format!("{}\n", crypto::Crypto::key_to_string(&key));
+    config::write_new_private(path, &contents)?;
+    println!("generated encryption key file {}", path.display());
+    Ok(())
+}
+
+async fn init(encrypt: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     if let Ok(repo) = Repo::discover(&cwd) {
         bail!(
@@ -210,30 +340,31 @@ async fn init(encrypt: bool) -> Result<()> {
     let (channel_id, channel_access_hash, existed) = tg.ensure_channel(&title).await?;
 
     // Adopting an existing channel (e.g. on a new machine): fetch its pinned
-    // index so `tgfs get` can restore immediately — prompting for the
-    // encryption key if the snapshot turns out to be sealed.
+    // index so `tgfs get` can restore immediately. Encrypted snapshots require
+    // an explicit --key or --keyfile.
     let snapshot = if existed {
         let peer = tg.peer_from(channel_id, channel_access_hash)?;
-        fetch_remote_snapshot(&tg, peer, None).await?
+        let snapshot = fetch_remote_snapshot(&tg, peer, supplied_key.as_ref()).await?;
+        if snapshot.is_none() {
+            println!("channel has no index snapshot yet — initializing it empty");
+        }
+        snapshot
     } else {
         None
     };
-    let existing_key = snapshot.as_ref().and_then(|f| f.key.clone());
-    let encryption_key = match existing_key {
-        Some(key) => {
-            if encrypt {
-                println!("channel is already encrypted — keeping its existing key");
-            }
-            Some(key)
-        }
-        None if encrypt => {
-            let key = crypto::Crypto::key_to_string(&crypto::Crypto::generate_key());
-            println!("generated encryption key: {key}");
-            println!("KEEP IT SAFE: without it, encrypted backups cannot be restored");
-            Some(key)
-        }
-        None => None,
+    let remote_encrypted = snapshot.as_ref().is_some_and(|snapshot| snapshot.encrypted);
+    let generated_key = if encrypt && supplied_key.is_none() && !remote_encrypted {
+        let key = crypto::Crypto::generate_key();
+        println!(
+            "generated encryption key: {}",
+            crypto::Crypto::key_to_string(&key)
+        );
+        println!("KEEP IT SAFE: pass it with --key or --keyfile for encrypted operations");
+        Some(key)
+    } else {
+        None
     };
+    let effective_key = supplied_key.as_ref().or(generated_key.as_ref());
 
     let repo = Repo::create(
         &cwd,
@@ -241,7 +372,8 @@ async fn init(encrypt: bool) -> Result<()> {
             channel_id,
             channel_access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
-            encryption_key,
+            encrypted: encrypt || remote_encrypted,
+            key_verifier: effective_key.map(crypto::Crypto::key_verifier),
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -249,7 +381,7 @@ async fn init(encrypt: bool) -> Result<()> {
         sync::import_snapshot(&mut index, &f.plain, f.info)?;
     }
     println!(
-        "initialized tgfs repo at {} — `tgfs status` to compare, `tgfs sync` to push",
+        "initialized tgfs repo at {} — `tgfs status` to compare, `tgfs push` to upload",
         repo.root.display()
     );
     Ok(())
@@ -279,7 +411,7 @@ async fn channels() -> Result<()> {
 }
 
 /// Adopt an existing channel into a fresh folder and pull its index.
-async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<()> {
+async fn clone(name: &str, dir: Option<PathBuf>, key: Option<[u8; 32]>) -> Result<()> {
     let title = if name.starts_with("tgfs-") {
         name.to_string()
     } else {
@@ -298,21 +430,17 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<
         .await?
         .with_context(|| format!("no channel titled {title:?} — see `tgfs channels`"))?;
 
-    // Validate a provided key before doing anything with it.
-    if let Some(k) = &key {
-        crypto::Crypto::key_from_string(k)?;
-    }
-    // Fetch (and, for an encrypted repo, prompt for the key and decrypt)
-    // BEFORE creating the folder, so a wrong key leaves nothing behind.
+    // Fetch and decrypt BEFORE creating the folder, so a missing or wrong key
+    // leaves nothing behind.
     let peer = tg.peer_from(channel.id, channel.access_hash)?;
-    let fetched = fetch_remote_snapshot(&tg, peer, key).await?;
+    let fetched = fetch_remote_snapshot(&tg, peer, key.as_ref()).await?;
 
     std::fs::create_dir_all(&dest)?;
-    let (encryption_key, snapshot) = match fetched {
-        Some(f) => (f.key, Some((f.info, f.plain))),
+    let (encrypted, snapshot) = match fetched {
+        Some(f) => (f.encrypted || key.is_some(), Some((f.info, f.plain))),
         None => {
             println!("channel has no index snapshot yet — cloning it empty");
-            (None, None)
+            (key.is_some(), None)
         }
     };
     let repo = Repo::create(
@@ -321,7 +449,8 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<
             channel_id: channel.id,
             channel_access_hash: channel.access_hash,
             chunk_size: config::DEFAULT_CHUNK_SIZE,
-            encryption_key,
+            encrypted,
+            key_verifier: key.as_ref().map(crypto::Crypto::key_verifier),
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -339,7 +468,7 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<
 async fn share(user: Option<String>, write: bool, link: bool) -> Result<()> {
     let (repo, _index, tg) = open_repo().await?;
     let peer = tg.peer(&repo.config)?;
-    let encrypted = repo.config.encryption_key.is_some();
+    let encrypted = repo.config.encrypted;
 
     if link {
         if write {
@@ -348,7 +477,7 @@ async fn share(user: Option<String>, write: bool, link: bool) -> Result<()> {
         let url = tg.export_invite_link(peer).await?;
         println!("{url}");
         if encrypted {
-            println!("note: this repo is encrypted — also send the key (`tgfs key`) securely");
+            println!("note: this repo is encrypted — also provide its key securely");
         }
         return Ok(());
     }
@@ -364,7 +493,7 @@ async fn share(user: Option<String>, write: bool, link: bool) -> Result<()> {
     let role = if write { "writer" } else { "reader" };
     println!("invited {user} as {role} — they can now `tgfs clone` this repo");
     if encrypted {
-        println!("note: this repo is encrypted — also send the key (`tgfs key`) securely");
+        println!("note: this repo is encrypted — also provide its key securely");
     }
     Ok(())
 }
@@ -375,17 +504,15 @@ struct FetchedSnapshot {
     info: tg::RemoteIndexInfo,
     /// zstd-compressed snapshot JSON (already decrypted).
     plain: Vec<u8>,
-    /// Key that successfully opened it: from `--key` or an interactive prompt.
-    key: Option<String>,
+    encrypted: bool,
 }
 
-/// Download the channel's pinned snapshot. If it is encrypted, obtain the
-/// key — from `key_flag` if given, otherwise by prompting (3 attempts) —
-/// and validate it against the snapshot before returning it.
+/// Download the channel's pinned snapshot and decrypt it with the supplied
+/// key when necessary.
 async fn fetch_remote_snapshot(
     tg: &Tg,
     peer: grammers_client::session::types::PeerRef,
-    key_flag: Option<String>,
+    key: Option<&[u8; 32]>,
 ) -> Result<Option<FetchedSnapshot>> {
     let Some(info) = tg.remote_index_info(peer).await? else {
         return Ok(None);
@@ -394,45 +521,25 @@ async fn fetch_remote_snapshot(
     tg.download_document(peer, info.msg_id, &mut raw).await?;
 
     if !crypto::Crypto::is_sealed_blob(&raw) {
-        if key_flag.is_some() {
-            println!("note: --key given but this repo's snapshots are not encrypted");
+        if key.is_some() {
+            println!("note: an encryption key was supplied but the snapshot is not encrypted");
         }
         return Ok(Some(FetchedSnapshot {
             info,
             plain: raw,
-            key: key_flag,
+            encrypted: false,
         }));
     }
 
-    let interactive = key_flag.is_none();
-    let mut attempt = 0;
-    let mut key_str = key_flag;
-    loop {
-        attempt += 1;
-        let candidate = match key_str.take() {
-            Some(k) => k,
-            None => {
-                println!("this repo is encrypted; its key is needed to read the index");
-                rpassword::prompt_password("Encryption key (base64): ")?
-                    .trim()
-                    .to_string()
-            }
-        };
-        let opened = crypto::Crypto::key_from_string(&candidate)
-            .map(|k| crypto::Crypto::new(&k))
-            .and_then(|c| c.open_blob(&raw));
-        match opened {
-            Ok(plain) => {
-                return Ok(Some(FetchedSnapshot {
-                    info,
-                    plain,
-                    key: Some(candidate),
-                }));
-            }
-            Err(e) if interactive && attempt < 3 => eprintln!("{e}; try again"),
-            Err(e) => return Err(e.context("cannot decrypt the remote index snapshot")),
-        }
-    }
+    let key = key.context("the remote snapshot is encrypted; supply --key or --keyfile")?;
+    let plain = crypto::Crypto::new(key)
+        .open_blob(&raw)
+        .context("cannot decrypt the remote index snapshot")?;
+    Ok(Some(FetchedSnapshot {
+        info,
+        plain,
+        encrypted: true,
+    }))
 }
 
 type OpenedRepo = (Repo, Index, Tg);
@@ -474,4 +581,141 @@ fn prompt(msg: &str) -> Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn encoded_key(byte: u8) -> String {
+        crypto::Crypto::key_to_string(&[byte; 32])
+    }
+
+    fn repo_with_verifier(encrypted: bool, verifier: Option<String>) -> Repo {
+        Repo {
+            root: PathBuf::new(),
+            config: RepoConfig {
+                channel_id: 1,
+                channel_access_hash: 2,
+                chunk_size: config::DEFAULT_CHUNK_SIZE,
+                encrypted,
+                key_verifier: verifier,
+            },
+        }
+    }
+
+    #[test]
+    fn cli_uses_push_and_enforces_key_sources() {
+        let key = encoded_key(7);
+        assert!(Cli::try_parse_from(["tgfs", "genkey", "key.txt"]).is_ok());
+        assert!(Cli::try_parse_from(["tgfs", "push"]).is_ok());
+        assert!(Cli::try_parse_from(["tgfs", "sync"]).is_err());
+        assert!(Cli::try_parse_from(["tgfs", "key"]).is_err());
+        assert!(
+            Cli::try_parse_from(["tgfs", "init", "--key", &key]).is_err(),
+            "init keys require --encrypt"
+        );
+        assert!(Cli::try_parse_from(["tgfs", "init", "--encrypt", "--key", &key]).is_ok());
+        assert!(
+            Cli::try_parse_from(["tgfs", "push", "--key", &key, "--keyfile", "key.txt",]).is_err(),
+            "--key and --keyfile are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn encryption_key_options_are_bound_to_environment_variables() {
+        use std::ffi::OsStr;
+
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+        for subcommand_name in ["init", "push", "pull", "get", "clone"] {
+            let subcommand = command
+                .find_subcommand(subcommand_name)
+                .expect("key-accepting subcommand exists");
+            let key = subcommand
+                .get_arguments()
+                .find(|argument| argument.get_id() == "key")
+                .expect("--key argument exists");
+            let keyfile = subcommand
+                .get_arguments()
+                .find(|argument| argument.get_id() == "keyfile")
+                .expect("--keyfile argument exists");
+
+            assert_eq!(key.get_env(), Some(OsStr::new("TGFS_KEY")));
+            assert_eq!(keyfile.get_env(), Some(OsStr::new("TGFS_KEYFILE")));
+        }
+    }
+
+    #[test]
+    fn keyfile_is_trimmed_and_validated() {
+        let path = std::env::temp_dir().join(format!("tgfs-key-test-{}", std::process::id()));
+        let key = encoded_key(9);
+        std::fs::write(&path, format!("{key}\n")).unwrap();
+        let args = KeyArgs {
+            key: None,
+            keyfile: Some(path.clone()),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(args.load().is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(args.load().unwrap(), Some([9u8; 32]));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn genkey_creates_a_private_file_without_overwriting() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tgfs-genkey-test-{}-{unique}",
+            std::process::id()
+        ));
+        generate_keyfile(&path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.ends_with('\n'));
+        assert!(crypto::Crypto::key_from_string(&contents).is_ok());
+        assert!(
+            KeyArgs {
+                key: None,
+                keyfile: Some(path.clone()),
+            }
+            .load()
+            .unwrap()
+            .is_some()
+        );
+        assert!(generate_keyfile(&path).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn verifier_rejects_a_different_key() {
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+        let mut repo = repo_with_verifier(false, None);
+        assert!(configure_repo_encryption(&mut repo, Some(&first)).unwrap());
+        assert!(repo.config.encrypted);
+        assert_eq!(
+            repo.config.key_verifier,
+            Some(crypto::Crypto::key_verifier(&first))
+        );
+        let serialized = toml::to_string(&repo.config).unwrap();
+        assert!(serialized.contains("encrypted = true"));
+        assert!(serialized.contains("key_verifier"));
+        assert!(!serialized.contains(&crypto::Crypto::key_to_string(&first)));
+        assert!(!configure_repo_encryption(&mut repo, Some(&first)).unwrap());
+        assert!(configure_repo_encryption(&mut repo, Some(&second)).is_err());
+        assert!(configure_repo_encryption(&mut repo, None).is_err());
+    }
 }

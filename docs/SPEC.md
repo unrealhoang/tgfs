@@ -66,10 +66,18 @@ stable message IDs, and access control.
   cloud chats are not E2E-encrypted: XChaCha20-Poly1305 over independent
   1 MiB segments, with nonces derived (keyed BLAKE3) from the chunk's
   plaintext hash and segment number. Deterministic ciphertext keeps dedup
-  and upload resume working; the per-repo key lives in `.tgfs/config.toml`
-  (`tgfs key` prints it; `tgfs clone`/`tgfs init` on a new machine take it via `--key` or prompt for it, validating it against the pinned snapshot).
+  and upload resume working. `tgfs init`, `push`, `pull`, `get`, and `clone`
+  accept the key via `--key` or `--keyfile`, validating it before use.
   Index snapshots are sealed with the same key. Sizes, chunk counts and
   chunk equality remain visible — contents do not.
+- `--key` and `--keyfile` are mutually exclusive. Key files contain the same
+  base64 text as `--key`, with surrounding whitespace ignored. The secret is
+  never persisted: `.tgfs/config.toml` stores only `encrypted = true` and a
+  domain-separated BLAKE3 verifier used to reject a wrong key locally.
+  `TGFS_KEY` and `TGFS_KEYFILE` populate the corresponding options and are the
+  preferred interface, with `TGFS_KEYFILE` recommended for automation. On
+  Unix, a keyfile must have no group or other permission bits (`0600` and
+  `0400` are accepted).
 
 ## 3. Where to store metadata
 
@@ -78,9 +86,9 @@ truth:
 
 1. **Local index** — SQLite (`.tgfs/index.db` inside the synced folder):
    tables for `files` (path, size, mtime, file hash), `chunks` (hash, size,
-   message_id), `snapshots` (sync runs), and `meta` (index version, base
-   remote version). Used for fast diffing during `tgfs sync`.
-2. **Remote index** — after each sync, the index is serialized (JSON,
+   message_id), `snapshots` (push runs), and `meta` (index version, base
+   remote version). Used for fast diffing during `tgfs push`.
+2. **Remote index** — after each push, the index is serialized (JSON,
    zstd-compressed), uploaded to the same channel as a document, and the
    message is **pinned**. Recovery on a new machine = find the pinned message,
    download, rebuild SQLite. Old index snapshots are kept, giving free
@@ -97,11 +105,11 @@ version is embedded in the pinned message's caption
 and remote state only needs `messages.getPinnedMessage` — no snapshot
 download. The local index remembers the last version it pushed or pulled:
 
-- local == remote — **up to date**; `sync` pushes version N+1.
-- local < remote — **behind** (another machine pushed); `sync` refuses until
+- local == remote — **up to date**; `push` uploads version N+1.
+- local < remote — **behind** (another machine pushed); `push` refuses until
   `tgfs pull` imports the newer remote snapshot (or `--force` overrides).
 - local > remote — **ahead** (a push half-failed or the pin was changed);
-  `sync --force` re-publishes, `pull --force` rolls back.
+  `push --force` re-publishes, `pull --force` rolls back.
 
 This is git-flavored optimistic locking, not merging: concurrent writers are
 detected, and the loser is told to pull first.
@@ -116,27 +124,27 @@ private channel, named `tgfs-<folder-name>`.
 
 ```
 tgfs login               # authenticate the Telegram account (once per machine)
-tgfs init [--encrypt]    # in the folder to back up: create .tgfs/ + the channel
+tgfs genkey <path>       # create a new 0600 key file without overwriting
+tgfs init [--encrypt] [--key <k> | --keyfile <path>]
 tgfs status              # local changes vs index, and local vs remote version
-tgfs sync                # push new/changed files, tombstone deleted, pin snapshot
-tgfs pull                # import a newer remote index snapshot
+tgfs push [--key <k> | --keyfile <path>]
+tgfs pull [--key <k> | --keyfile <path>]
 tgfs ls [prefix]         # list indexed files
-tgfs get <path> [dest]   # restore a file or folder from the channel
+tgfs get <path> [dest] [--key <k> | --keyfile <path>]
 tgfs log                 # list index snapshots
 tgfs channels            # list this account's tgfs channels (repos to clone)
-tgfs clone <name> [dir] [--key <k>]  # pull an existing channel into a new folder
-tgfs key                 # print this repo's encryption key
+tgfs clone <name> [dir] [--key <k> | --keyfile <path>]
 tgfs share <@user> [--write] | --link  # share this repo (see §5)
 tgfs members             # list who has access
 tgfs unshare <@user>     # remove access
 ```
 
-- `tgfs sync` is idempotent and incremental (mtime+size fast path, hash to
+- `tgfs push` is idempotent and incremental (mtime+size fast path, hash to
   confirm), safe to run from cron/systemd-timer.
 - Account credentials (api_id/api_hash) in `~/.config/tgfs/config.toml` and
   the MTProto session in `~/.local/share/tgfs/session.db` are per-machine;
-  `.tgfs/config.toml` (channel, chunk size) is per-repo. Secrets are stored
-  with 0600 perms.
+  `.tgfs/config.toml` (channel, chunk size, encryption verifier) is per-repo.
+  Encryption keys are never stored by tgfs.
 - `tgfs init` in a folder whose channel already exists adopts it and pulls
   the pinned index — that is the recovery path on a new machine.
 - Nice-to-haves after v1: `--watch` mode, include/exclude globs, `tgfs verify`
@@ -150,10 +158,10 @@ channel, so:
 
 - **membership = read access** (any subscriber can download every chunk and
   the index snapshots);
-- **admin with post+pin rights = write access** (`sync` needs to post chunk
+- **admin with post+pin rights = write access** (`push` needs to post chunk
   documents and re-pin the index snapshot). In a broadcast channel
   non-admins cannot post, so Telegram itself enforces read-only — a
-  reader's `tgfs sync` fails server-side, while `status`/`pull`/`get` work.
+  reader's `tgfs push` fails server-side, while `status`/`pull`/`get` work.
 
 ```
 tgfs share <@user> [--write]   # invite a user (writer = post+pin admin)
@@ -165,13 +173,14 @@ tgfs unshare <@user>           # demote and remove a user
 Recipient flow: after joining, the channel shows up in `tgfs channels`, and
 `tgfs clone <name>` adopts it — same path as a second machine of the owner.
 Writers collaborate safely thanks to index versioning (§3): concurrent
-syncs are detected and the loser pulls first.
+pushes are detected and the loser pulls first.
 
 Encryption interacts as expected:
 
-- The key never touches Telegram. For an encrypted repo the owner sends it
-  out-of-band (`tgfs key` → any secure channel); `clone` prompts for it and
-  validates it against the pinned snapshot.
+- The key never touches Telegram or `.tgfs/config.toml`. For an encrypted repo
+  the owner provides it out-of-band; commands accept it only through `--key`
+  or `--keyfile` and validate it against the local verifier or encrypted
+  snapshot.
 - Channel membership without the key reveals only sizes, chunk counts and
   chunk equality — an encrypted repo can be "shared" with an untrusted
   relay (e.g. a bot that mirrors the channel) without exposing contents.
@@ -195,7 +204,7 @@ Out of scope for v1, but the design keeps it possible:
   `mount` cargo feature: `tgfs mount <mountpoint>`.
 - Reads map directly onto `upload.getFile` offset/limit — random access works
   without downloading whole chunks; add an LRU block cache on disk.
-- Read-only first; write support would reuse the sync pipeline (write-back on
+- Read-only first; write support would reuse the push pipeline (write-back on
   close/fsync).
 
 ## 7. Milestones
@@ -204,7 +213,7 @@ Out of scope for v1, but the design keeps it possible:
 - [x] **M2** — chunked upload/download of a single file (chunk-level resume:
       already-uploaded chunks are skipped on retry; part-level resume within a
       chunk is left to M4).
-- [x] **M3** — SQLite index, `sync`/`ls`/`get`, remote index snapshots.
+- [x] **M3** — SQLite index, `push`/`ls`/`get`, remote index snapshots.
 - [x] **M4** — hardening: FLOOD_WAIT handling (client-wide retry policy),
       parallel part uploads, part-level resume (journaled), client-side
       encryption, index restore from a pinned snapshot (`pull`/`clone`).

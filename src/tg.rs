@@ -1,25 +1,15 @@
-//! Thin wrapper around grammers: connect, log in, and move chunk-sized
-//! documents in and out of the private storage channel.
+//! Telegram connection, authentication, channel discovery, and access control.
 
 use std::io::Write as _;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use grammers_client::message::InputMessage;
 use grammers_client::session::Session as _;
 use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
-use grammers_client::{Client, SenderPool, SignInError, media::Media, tl};
-use tokio::io::AsyncRead;
+use grammers_client::{Client, SenderPool, SignInError, tl};
 
 use crate::config::{RepoConfig, session_path};
 use crate::session::FileSession;
-
-/// Telegram upload part size. Must be a power of two ≤ 512 KiB.
-pub const PART_SIZE: u64 = 512 * 1024;
-/// Above this, Telegram requires the big-file upload path (which is also the
-/// resumable one).
-pub const BIG_FILE_THRESHOLD: u64 = 10 * 1024 * 1024;
-const UPLOAD_WORKERS: usize = 4;
 
 /// Retry policy tuned for unattended backups: sleep out flood waits up to
 /// 30 minutes (Telegram tells us how long), retry a few times on transient
@@ -49,32 +39,6 @@ impl grammers_client::client::RetryPolicy for BackupRetry {
             _ => ControlFlow::Break(()),
         }
     }
-}
-
-/// Random-access byte source for the resumable uploader. Implementations
-/// must be cheap to read from multiple tasks at once (pread-style).
-pub trait PartSource: Send + Sync {
-    /// Total number of bytes this source will upload.
-    fn len(&self) -> u64;
-    /// Fill `buf` exactly, starting at `offset`.
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
-
-    #[allow(dead_code)]
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn read_part(&self, part: i32) -> Result<Vec<u8>> {
-        let offset = part as u64 * PART_SIZE;
-        let len = PART_SIZE.min(self.len() - offset) as usize;
-        let mut buf = vec![0u8; len];
-        self.read_at(offset, &mut buf)?;
-        Ok(buf)
-    }
-}
-
-pub fn total_parts(len: u64) -> i32 {
-    len.div_ceil(PART_SIZE) as i32
 }
 
 pub struct Tg {
@@ -222,187 +186,6 @@ impl Tg {
         })
     }
 
-    /// Upload `size` bytes from `stream` as a document named `name`, with
-    /// `caption` for human browsing. Returns the message id.
-    pub async fn upload_document<S: AsyncRead + Unpin>(
-        &self,
-        peer: PeerRef,
-        stream: &mut S,
-        size: usize,
-        name: String,
-        caption: &str,
-    ) -> Result<i32> {
-        let uploaded = self
-            .client
-            .upload_stream(stream, size, name)
-            .await
-            .context("upload failed")?;
-        self.send_uploaded(peer, uploaded, caption).await
-    }
-
-    async fn send_uploaded(
-        &self,
-        peer: PeerRef,
-        uploaded: grammers_client::media::Uploaded,
-        caption: &str,
-    ) -> Result<i32> {
-        let msg = self
-            .client
-            .send_message(
-                peer,
-                InputMessage::new()
-                    .text(caption)
-                    .mime_type("application/octet-stream")
-                    .document(uploaded),
-            )
-            .await
-            .context("failed to send document message")?;
-        Ok(msg.id())
-    }
-
-    /// Upload a [`PartSource`] as a document and send it. Files above
-    /// [`BIG_FILE_THRESHOLD`] go through Telegram's big-file path with
-    /// [`UPLOAD_WORKERS`] parallel part uploads and are resumable:
-    /// `resume` continues a previous attempt (same Telegram `file_id`), and
-    /// `on_progress(file_id, done_parts)` is called as the contiguous prefix
-    /// of confirmed parts grows, so the caller can journal it.
-    pub async fn upload_source(
-        &self,
-        peer: PeerRef,
-        source: Arc<dyn PartSource>,
-        name: String,
-        caption: &str,
-        resume: Option<(i64, i32)>,
-        mut on_progress: impl FnMut(i64, i32) -> Result<()>,
-    ) -> Result<i32> {
-        let len = source.len();
-        if len == 0 {
-            bail!("refusing to upload an empty document");
-        }
-
-        if len <= BIG_FILE_THRESHOLD {
-            let mut buf = vec![0u8; len as usize];
-            source.read_at(0, &mut buf)?;
-            let mut cursor = std::io::Cursor::new(buf);
-            let uploaded = self
-                .client
-                .upload_stream(&mut cursor, len as usize, name)
-                .await
-                .context("upload failed")?;
-            return self.send_uploaded(peer, uploaded, caption).await;
-        }
-
-        let total = total_parts(len);
-        let (file_id, start) = match resume {
-            Some((id, done)) => {
-                println!("    resuming upload at part {done}/{total}");
-                (id, done)
-            }
-            None => (rand::random::<i64>(), 0),
-        };
-        on_progress(file_id, start)?;
-
-        // Workers pull part numbers from a shared counter and report each
-        // confirmed part back; this task tracks the contiguous prefix.
-        let next = Arc::new(std::sync::atomic::AtomicI32::new(start));
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut workers = tokio::task::JoinSet::new();
-        for _ in 0..UPLOAD_WORKERS {
-            let client = self.client.clone();
-            let source = Arc::clone(&source);
-            let next = Arc::clone(&next);
-            let done_tx = done_tx.clone();
-            workers.spawn(async move {
-                loop {
-                    let part = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if part >= total {
-                        return Ok(());
-                    }
-                    let bytes = source.read_part(part)?;
-                    let ok = client
-                        .invoke(&tl::functions::upload::SaveBigFilePart {
-                            file_id,
-                            file_part: part,
-                            file_total_parts: total,
-                            bytes,
-                        })
-                        .await
-                        .with_context(|| format!("failed to upload part {part}/{total}"))?;
-                    if !ok {
-                        bail!("Telegram rejected part {part}/{total}");
-                    }
-                    if done_tx.send(part).is_err() {
-                        return Ok(());
-                    }
-                }
-            });
-        }
-        drop(done_tx);
-
-        let mut confirmed = std::collections::BTreeSet::new();
-        let mut watermark = start;
-        while let Some(part) = done_rx.recv().await {
-            confirmed.insert(part);
-            let mut advanced = false;
-            while confirmed.remove(&watermark) {
-                watermark += 1;
-                advanced = true;
-            }
-            if advanced {
-                on_progress(file_id, watermark)?;
-            }
-        }
-        while let Some(result) = workers.join_next().await {
-            result.context("upload worker panicked")??;
-        }
-        if watermark != total {
-            bail!("upload incomplete: {watermark}/{total} parts confirmed");
-        }
-
-        let uploaded = grammers_client::media::Uploaded {
-            raw: tl::enums::InputFile::Big(tl::types::InputFileBig {
-                id: file_id,
-                parts: total,
-                name,
-            }),
-        };
-        self.send_uploaded(peer, uploaded, caption).await
-    }
-
-    /// Stream the document in message `msg_id` into `out`, returning the
-    /// number of bytes written.
-    pub async fn download_document<W: std::io::Write>(
-        &self,
-        peer: PeerRef,
-        msg_id: i32,
-        out: &mut W,
-    ) -> Result<u64> {
-        let msgs = self.client.get_messages_by_id(peer, &[msg_id]).await?;
-        let msg = msgs
-            .into_iter()
-            .next()
-            .flatten()
-            .with_context(|| format!("message {msg_id} not found in storage channel"))?;
-        let media = msg
-            .media()
-            .with_context(|| format!("message {msg_id} has no media"))?;
-        let doc = match media {
-            Media::Document(doc) => doc,
-            other => bail!("message {msg_id} is not a document: {other:?}"),
-        };
-        let mut total = 0u64;
-        let mut download = self.client.iter_download(&doc);
-        while let Some(chunk) = download
-            .next()
-            .await
-            .with_context(|| format!("download of message {msg_id} failed"))?
-        {
-            total += chunk.len() as u64;
-            out.write_all(&chunk)?;
-        }
-        Ok(total)
-    }
-
     pub async fn pin(&self, peer: PeerRef, msg_id: i32) -> Result<()> {
         self.client
             .pin_message(peer, msg_id)
@@ -517,37 +300,6 @@ impl Tg {
         }
         Ok(out)
     }
-
-    /// Read the remote index version from the pinned snapshot's caption
-    /// (`tgfs-index v<N> ...`) without downloading the snapshot itself.
-    /// `None` means the channel has no pinned tgfs-index yet.
-    pub async fn remote_index_info(&self, peer: PeerRef) -> Result<Option<RemoteIndexInfo>> {
-        let pinned = match self.client.get_pinned_message(peer).await {
-            Ok(pinned) => pinned,
-            // Telegram returns this RPC error for InputMessage::Pinned when
-            // the channel has no pinned message. grammers currently exposes
-            // it as an error instead of the documented `None` result.
-            Err(grammers_client::InvocationError::Rpc(error))
-                if error.is("MESSAGE_IDS_EMPTY") =>
-            {
-                None
-            }
-            Err(error) => return Err(error).context("failed to fetch pinned message"),
-        };
-        let Some(msg) = pinned else {
-            return Ok(None);
-        };
-        Ok(parse_index_caption(msg.text()).map(|version| RemoteIndexInfo {
-            version,
-            msg_id: msg.id(),
-        }))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RemoteIndexInfo {
-    pub version: u64,
-    pub msg_id: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -555,33 +307,6 @@ pub struct ChannelInfo {
     pub id: i64,
     pub access_hash: i64,
     pub title: String,
-}
-
-/// Caption format written by snapshot uploads: `tgfs-index v<N> ...`.
-pub fn index_caption(version: u64, files: usize, chunks: usize, created_at: i64) -> String {
-    format!("tgfs-index v{version} files={files} chunks={chunks} created={created_at}")
-}
-
-fn parse_index_caption(text: &str) -> Option<u64> {
-    let rest = text.strip_prefix("tgfs-index v")?;
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn caption_roundtrip() {
-        let caption = index_caption(42, 10, 12, 1_752_000_000);
-        assert_eq!(parse_index_caption(&caption), Some(42));
-        assert_eq!(parse_index_caption("tgfs-index v7"), Some(7));
-        assert_eq!(parse_index_caption("something else"), None);
-        assert_eq!(parse_index_caption("tgfs-index vX"), None);
-    }
 }
 
 fn prompt(msg: &str) -> Result<String> {

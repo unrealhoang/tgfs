@@ -10,7 +10,8 @@ use grammers_client::session::types::PeerRef;
 use crate::crypto::{Crypto, DecryptingWriter};
 use crate::diff::LocalFile;
 use crate::index::{ChunkEntry, FileEntry, Index};
-use crate::tg::{PartSource, Tg, total_parts};
+use crate::telegram_transfer::{PartSource, total_parts};
+use crate::tg::Tg;
 
 const HASH_BUF_SIZE: usize = 1024 * 1024;
 

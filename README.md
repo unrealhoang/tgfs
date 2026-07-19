@@ -16,6 +16,8 @@ tgfs pull                # import a newer remote index snapshot
 tgfs ls [prefix]         # list indexed files
 tgfs get <path> [dest]   # restore a file or folder
 tgfs log                 # list index snapshots
+tgfs channels            # list this account's tgfs channels (repos to clone)
+tgfs clone <name> [dir]  # pull an existing channel's index into a new folder
 ```
 
 Every sync pins a versioned index snapshot in the channel; `status`, `sync`

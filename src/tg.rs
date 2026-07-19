@@ -70,25 +70,48 @@ impl Tg {
         Ok(())
     }
 
-    /// Find the storage channel among the dialogs, or create a new private
-    /// broadcast channel. Returns `(channel_id, access_hash, existed)`.
-    pub async fn ensure_channel(&self, title: &str) -> Result<(i64, i64, bool)> {
+    /// List channels in the account's dialogs whose title starts with
+    /// `prefix` (pass `"tgfs-"` for tgfs storage channels).
+    pub async fn list_channels(&self, prefix: &str) -> Result<Vec<ChannelInfo>> {
+        let mut found = Vec::new();
         let mut dialogs = self.client.iter_dialogs();
         while let Some(dialog) = dialogs.next().await? {
             if let grammers_client::peer::Peer::Channel(channel) = dialog.peer()
-                && channel.title() == title
+                && channel.title().starts_with(prefix)
             {
                 let id = channel.id().bare_id().context("channel id")?;
-                let auth = self
+                let access_hash = self
                     .session
                     .peer_ref(channel.id())
                     .await
                     .map_err(|e| anyhow::anyhow!("session error: {e}"))?
                     .map(|r| r.auth.hash())
                     .unwrap_or_default();
-                println!("using existing channel {title:?} ({id})");
-                return Ok((id, auth, true));
+                found.push(ChannelInfo {
+                    id,
+                    access_hash,
+                    title: channel.title().to_string(),
+                });
             }
+        }
+        Ok(found)
+    }
+
+    /// Find a channel by exact title among the account's dialogs.
+    pub async fn find_channel(&self, title: &str) -> Result<Option<ChannelInfo>> {
+        Ok(self
+            .list_channels(title)
+            .await?
+            .into_iter()
+            .find(|c| c.title == title))
+    }
+
+    /// Find the storage channel among the dialogs, or create a new private
+    /// broadcast channel. Returns `(channel_id, access_hash, existed)`.
+    pub async fn ensure_channel(&self, title: &str) -> Result<(i64, i64, bool)> {
+        if let Some(existing) = self.find_channel(title).await? {
+            println!("using existing channel {title:?} ({})", existing.id);
+            return Ok((existing.id, existing.access_hash, true));
         }
 
         let updates = self
@@ -121,9 +144,13 @@ impl Tg {
     }
 
     pub fn peer(&self, config: &RepoConfig) -> Result<PeerRef> {
+        self.peer_from(config.channel_id, config.channel_access_hash)
+    }
+
+    pub fn peer_from(&self, channel_id: i64, access_hash: i64) -> Result<PeerRef> {
         Ok(PeerRef {
-            id: PeerId::channel(config.channel_id).context("invalid channel id in config")?,
-            auth: PeerAuth::from_hash(config.channel_access_hash),
+            id: PeerId::channel(channel_id).context("invalid channel id")?,
+            auth: PeerAuth::from_hash(access_hash),
         })
     }
 
@@ -220,6 +247,13 @@ impl Tg {
 pub struct RemoteIndexInfo {
     pub version: u64,
     pub msg_id: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub id: i64,
+    pub access_hash: i64,
+    pub title: String,
 }
 
 /// Caption format written by snapshot uploads: `tgfs-index v<N> ...`.

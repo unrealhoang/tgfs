@@ -62,6 +62,15 @@ enum Command {
     },
     /// List index snapshots known to this repo
     Log,
+    /// List this account's tgfs channels (repos you can clone)
+    Channels,
+    /// Pull an existing tgfs channel into a new folder
+    Clone {
+        /// Channel to clone: folder name or full channel title (tgfs-<name>)
+        name: String,
+        /// Destination folder (defaults to the name without the tgfs- prefix)
+        dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -96,6 +105,8 @@ async fn main() -> Result<()> {
             let (repo, index, tg) = open_repo().await?;
             sync::get(&tg, &index, &repo, &path, dest).await
         }
+        Command::Channels => channels().await,
+        Command::Clone { name, dir } => clone(&name, dir).await,
         Command::Log => {
             let repo = Repo::discover(&std::env::current_dir()?)?;
             let index = Index::open(&repo.index_path())?;
@@ -158,6 +169,67 @@ async fn init() -> Result<()> {
     }
     println!(
         "initialized tgfs repo at {} — `tgfs status` to compare, `tgfs sync` to push",
+        repo.root.display()
+    );
+    Ok(())
+}
+
+/// List all tgfs-* channels of the account, with their pinned index state.
+async fn channels() -> Result<()> {
+    let global = GlobalConfig::load()?;
+    let tg = connect_authorized(&global).await?;
+    let found = tg.list_channels("tgfs-").await?;
+    if found.is_empty() {
+        println!("no tgfs channels on this account — `tgfs init` in a folder creates one");
+        return Ok(());
+    }
+    for channel in found {
+        let name = channel.title.strip_prefix("tgfs-").unwrap_or(&channel.title);
+        let peer = tg.peer_from(channel.id, channel.access_hash)?;
+        let remote = match tg.remote_index_info(peer).await {
+            Ok(Some(info)) => format!("index v{}", info.version),
+            Ok(None) => "no index snapshot".to_string(),
+            Err(e) => format!("index unreadable: {e}"),
+        };
+        println!("{name:<30}  {}  ({remote})", channel.title);
+    }
+    println!("clone one with `tgfs clone <name>`");
+    Ok(())
+}
+
+/// Adopt an existing channel into a fresh folder and pull its index.
+async fn clone(name: &str, dir: Option<PathBuf>) -> Result<()> {
+    let title = if name.starts_with("tgfs-") {
+        name.to_string()
+    } else {
+        format!("tgfs-{name}")
+    };
+    let folder_name = title.strip_prefix("tgfs-").expect("prefixed above");
+    let dest = dir.unwrap_or_else(|| PathBuf::from(folder_name));
+    if dest.join(config::REPO_DIR).exists() {
+        bail!("{} is already a tgfs repo", dest.display());
+    }
+
+    let global = GlobalConfig::load()?;
+    let tg = connect_authorized(&global).await?;
+    let channel = tg
+        .find_channel(&title)
+        .await?
+        .with_context(|| format!("no channel titled {title:?} — see `tgfs channels`"))?;
+
+    std::fs::create_dir_all(&dest)?;
+    let repo = Repo::create(
+        &dest,
+        RepoConfig {
+            channel_id: channel.id,
+            channel_access_hash: channel.access_hash,
+            chunk_size: config::DEFAULT_CHUNK_SIZE,
+        },
+    )?;
+    let mut index = Index::open(&repo.index_path())?;
+    sync::pull(&tg, &mut index, &repo, false).await?;
+    println!(
+        "cloned {title:?} into {} — `tgfs ls` to browse, `tgfs get <path>` to restore files",
         repo.root.display()
     );
     Ok(())

@@ -411,6 +411,114 @@ impl Tg {
             .context("failed to pin message")
     }
 
+    /// Resolve a `@username` (leading `@` optional) to a peer reference.
+    pub async fn resolve_user(&self, username: &str) -> Result<PeerRef> {
+        let username = username.trim_start_matches('@');
+        let peer = self
+            .client
+            .resolve_username(username)
+            .await
+            .context("failed to resolve username")?
+            .with_context(|| format!("no Telegram user named @{username}"))?;
+        let id = peer.id();
+        let auth = self
+            .session
+            .peer_ref(id)
+            .await
+            .map_err(|e| anyhow::anyhow!("session error: {e}"))?;
+        Ok(auth.unwrap_or_else(|| id.to_ambient_ref()))
+    }
+
+    /// Invite a user into the storage channel (read access).
+    pub async fn invite(&self, channel: PeerRef, user: PeerRef) -> Result<()> {
+        self.client
+            .invoke(&tl::functions::channels::InviteToChannel {
+                channel: channel.into(),
+                users: vec![user.into()],
+            })
+            .await
+            .map_err(|e| match e {
+                grammers_client::InvocationError::Rpc(ref rpc)
+                    if rpc.name == "USER_PRIVACY_RESTRICTED" =>
+                {
+                    anyhow::anyhow!(
+                        "this user's privacy settings do not allow being added directly — \
+                         send them an invite link instead: `tgfs share --link`"
+                    )
+                }
+                e => anyhow::Error::from(e).context("failed to invite user"),
+            })?;
+        Ok(())
+    }
+
+    /// Grant or revoke write access: writers are admins with just enough
+    /// rights for `sync` (post chunk documents + re-pin the index snapshot).
+    pub async fn set_writer(&self, channel: PeerRef, user: PeerRef, write: bool) -> Result<()> {
+        self.client
+            .set_admin_rights(channel, user)
+            .post_messages(write)
+            .edit_messages(write)
+            .pin_messages(write)
+            .await
+            .context("failed to change admin rights")?;
+        Ok(())
+    }
+
+    /// Remove a user from the storage channel.
+    pub async fn remove_user(&self, channel: PeerRef, user: PeerRef) -> Result<()> {
+        // Writers must be demoted before they can be kicked.
+        self.set_writer(channel, user, false).await.ok();
+        self.client
+            .kick_participant(channel, user)
+            .await
+            .context("failed to remove user from the channel")?;
+        Ok(())
+    }
+
+    /// Create a permanent read-only invite link for the storage channel.
+    pub async fn export_invite_link(&self, channel: PeerRef) -> Result<String> {
+        let invite = self
+            .client
+            .invoke(&tl::functions::messages::ExportChatInvite {
+                legacy_revoke_permanent: false,
+                request_needed: false,
+                peer: channel.into(),
+                expire_date: None,
+                usage_limit: None,
+                title: Some("tgfs".to_string()),
+                subscription_pricing: None,
+            })
+            .await
+            .context("failed to create invite link")?;
+        match invite {
+            tl::enums::ExportedChatInvite::ChatInviteExported(inv) => Ok(inv.link),
+            other => bail!("unexpected invite response: {other:?}"),
+        }
+    }
+
+    /// List channel members as `(name, username, role)` strings.
+    pub async fn members(&self, channel: PeerRef) -> Result<Vec<(String, Option<String>, String)>> {
+        use grammers_client::peer::Role;
+        let mut out = Vec::new();
+        let mut iter = self.client.iter_participants(channel);
+        while let Some(participant) = iter.next().await? {
+            let role = match &participant.role {
+                Role::Creator(_) => "owner",
+                Role::Admin(a) if a.permissions().post_messages() => "writer",
+                Role::Admin(_) => "admin",
+                Role::User(_) => "reader",
+                Role::Banned(_) | Role::Left(_) => "removed",
+                _ => "unknown",
+            };
+            out.push((
+                participant.user.full_name(),
+                participant.user.username().map(str::to_string),
+                role.to_string(),
+            ));
+        }
+        Ok(out)
+    }
+
     /// Read the remote index version from the pinned snapshot's caption
     /// (`tgfs-index v<N> ...`) without downloading the snapshot itself.
     /// `None` means the channel has no pinned tgfs-index yet.

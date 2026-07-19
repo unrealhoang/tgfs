@@ -19,6 +19,9 @@ tgfs log                 # list index snapshots
 tgfs channels            # list this account's tgfs channels (repos to clone)
 tgfs clone <name> [dir]  # pull an existing channel's index into a new folder
 tgfs key                 # print this repo's encryption key
+tgfs share <@user> [--write] | --link  # share this repo with another user
+tgfs members             # list who has access
+tgfs unshare <@user>     # remove access
 ```
 
 Every sync pins a versioned index snapshot in the channel; `status`, `sync`

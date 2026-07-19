@@ -81,6 +81,24 @@ enum Command {
     },
     /// Print this repo's encryption key (keep it safe; needed to clone)
     Key,
+    /// Share this repo with another Telegram user
+    Share {
+        /// User to invite, e.g. @alice (omit when using --link)
+        user: Option<String>,
+        /// Grant write access (post + pin admin rights, needed for sync)
+        #[arg(long)]
+        write: bool,
+        /// Create a read-only invite link instead of inviting a user
+        #[arg(long)]
+        link: bool,
+    },
+    /// List who has access to this repo's channel
+    Members,
+    /// Remove a user's access to this repo
+    Unshare {
+        /// User to remove, e.g. @alice
+        user: String,
+    },
 }
 
 #[tokio::main]
@@ -117,6 +135,24 @@ async fn main() -> Result<()> {
         }
         Command::Channels => channels().await,
         Command::Clone { name, dir, key } => clone(&name, dir, key).await,
+        Command::Share { user, write, link } => share(user, write, link).await,
+        Command::Members => {
+            let (repo, _index, tg) = open_repo().await?;
+            let peer = tg.peer(&repo.config)?;
+            for (name, username, role) in tg.members(peer).await? {
+                let username = username.map(|u| format!(" (@{u})")).unwrap_or_default();
+                println!("{role:<8} {name}{username}");
+            }
+            Ok(())
+        }
+        Command::Unshare { user } => {
+            let (repo, _index, tg) = open_repo().await?;
+            let peer = tg.peer(&repo.config)?;
+            let target = tg.resolve_user(&user).await?;
+            tg.remove_user(peer, target).await?;
+            println!("removed {user} from this repo");
+            Ok(())
+        }
         Command::Key => {
             let repo = Repo::discover(&std::env::current_dir()?)?;
             match &repo.config.encryption_key {
@@ -296,6 +332,40 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<String>) -> Result<
         "cloned {title:?} into {} — `tgfs ls` to browse, `tgfs get <path>` to restore files",
         repo.root.display()
     );
+    Ok(())
+}
+
+/// Share the repo: invite a user (optionally as writer) or export a link.
+async fn share(user: Option<String>, write: bool, link: bool) -> Result<()> {
+    let (repo, _index, tg) = open_repo().await?;
+    let peer = tg.peer(&repo.config)?;
+    let encrypted = repo.config.encryption_key.is_some();
+
+    if link {
+        if write {
+            bail!("invite links are read-only; grant write with `tgfs share <@user> --write`");
+        }
+        let url = tg.export_invite_link(peer).await?;
+        println!("{url}");
+        if encrypted {
+            println!("note: this repo is encrypted — also send the key (`tgfs key`) securely");
+        }
+        return Ok(());
+    }
+
+    let Some(user) = user else {
+        bail!("specify a user to invite (e.g. `tgfs share @alice`) or use --link");
+    };
+    let target = tg.resolve_user(&user).await?;
+    tg.invite(peer, target).await?;
+    if write {
+        tg.set_writer(peer, target, true).await?;
+    }
+    let role = if write { "writer" } else { "reader" };
+    println!("invited {user} as {role} — they can now `tgfs clone` this repo");
+    if encrypted {
+        println!("note: this repo is encrypted — also send the key (`tgfs key`) securely");
+    }
     Ok(())
 }
 

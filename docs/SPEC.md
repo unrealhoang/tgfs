@@ -126,6 +126,9 @@ tgfs log                 # list index snapshots
 tgfs channels            # list this account's tgfs channels (repos to clone)
 tgfs clone <name> [dir] [--key <k>]  # pull an existing channel into a new folder
 tgfs key                 # print this repo's encryption key
+tgfs share <@user> [--write] | --link  # share this repo (see §5)
+tgfs members             # list who has access
+tgfs unshare <@user>     # remove access
 ```
 
 - `tgfs sync` is idempotent and incremental (mtime+size fast path, hash to
@@ -139,7 +142,52 @@ tgfs key                 # print this repo's encryption key
 - Nice-to-haves after v1: `--watch` mode, include/exclude globs, `tgfs verify`
   (re-hash remote chunks), `tgfs prune` (drop tombstoned data).
 
-## 5. Optional: mount as a real filesystem
+## 5. Sharing with other users
+
+Sharing rides entirely on Telegram's own access control — tgfs adds no
+server, accounts, or ACLs of its own. A repo *is* a private broadcast
+channel, so:
+
+- **membership = read access** (any subscriber can download every chunk and
+  the index snapshots);
+- **admin with post+pin rights = write access** (`sync` needs to post chunk
+  documents and re-pin the index snapshot). In a broadcast channel
+  non-admins cannot post, so Telegram itself enforces read-only — a
+  reader's `tgfs sync` fails server-side, while `status`/`pull`/`get` work.
+
+```
+tgfs share <@user> [--write]   # invite a user (writer = post+pin admin)
+tgfs share --link              # create a read-only invite link instead
+tgfs members                   # list members and their tgfs role
+tgfs unshare <@user>           # demote and remove a user
+```
+
+Recipient flow: after joining, the channel shows up in `tgfs channels`, and
+`tgfs clone <name>` adopts it — same path as a second machine of the owner.
+Writers collaborate safely thanks to index versioning (§3): concurrent
+syncs are detected and the loser pulls first.
+
+Encryption interacts as expected:
+
+- The key never touches Telegram. For an encrypted repo the owner sends it
+  out-of-band (`tgfs key` → any secure channel); `clone` prompts for it and
+  validates it against the pinned snapshot.
+- Channel membership without the key reveals only sizes, chunk counts and
+  chunk equality — an encrypted repo can be "shared" with an untrusted
+  relay (e.g. a bot that mirrors the channel) without exposing contents.
+
+Caveats, stated honestly:
+
+- Telegram privacy settings may forbid being invited directly
+  (`USER_PRIVACY_RESTRICTED`); `share --link` is the fallback.
+- Revoking (`unshare`) stops future access; it cannot claw back what was
+  already downloaded, and the encryption key cannot be rotated yet — key
+  rotation (re-encrypt + new snapshot lineage) is future work.
+- Writers are admins: Telegram cannot stop a malicious writer from deleting
+  messages history-wide. Share write access like you would push access to a
+  git remote.
+
+## 6. Optional: mount as a real filesystem
 
 Out of scope for v1, but the design keeps it possible:
 
@@ -150,7 +198,7 @@ Out of scope for v1, but the design keeps it possible:
 - Read-only first; write support would reuse the sync pipeline (write-back on
   close/fsync).
 
-## 6. Milestones
+## 7. Milestones
 
 - [x] **M1** — auth & channel bootstrap (`tgfs init`) with grammers.
 - [x] **M2** — chunked upload/download of a single file (chunk-level resume:
@@ -160,4 +208,6 @@ Out of scope for v1, but the design keeps it possible:
 - [x] **M4** — hardening: FLOOD_WAIT handling (client-wide retry policy),
       parallel part uploads, part-level resume (journaled), client-side
       encryption, index restore from a pinned snapshot (`pull`/`clone`).
+- [x] **M4.5** — sharing: `share`/`unshare`/`members` on top of channel
+      membership and admin rights (§5).
 - [ ] **M5 (optional)** — read-only FUSE mount.

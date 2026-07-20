@@ -1,6 +1,6 @@
 # Streaming working-tree scan — design
 
-Status: **proposed**. Changes `src/diff.rs`, `src/index.rs`, `src/sync.rs`.
+Status: **implemented**. Changes `src/diff.rs`, `src/index.rs`, `src/sync.rs`.
 
 tgfs is unreleased, so this design carries no migration or backward
 compatibility concerns beyond one additive index query.

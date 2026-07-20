@@ -12,7 +12,7 @@ pub const REPO_DIR: &str = ".tgfs";
 pub const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024 * 1024;
 pub const MAX_DOCUMENT_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PackConfig {
     /// Files smaller than this are packed. Zero disables packing.
@@ -38,7 +38,7 @@ pub struct GlobalConfig {
 }
 
 /// Per-repo settings (`<repo>/.tgfs/config.toml`).
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// Bare channel id of this repo's storage channel.
     pub channel_id: i64,
@@ -56,9 +56,13 @@ pub struct RepoConfig {
     /// persist and lets commands reject an incorrect supplied key locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_verifier: Option<String>,
+    /// Gitignore-style paths to omit from working-tree scans.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// A discovered tgfs repo: the folder being backed up plus its `.tgfs/`.
+#[derive(Clone)]
 pub struct Repo {
     pub root: PathBuf,
     pub config: RepoConfig,
@@ -66,6 +70,10 @@ pub struct Repo {
 
 fn default_chunk_size() -> u64 {
     DEFAULT_CHUNK_SIZE
+}
+
+pub fn default_excludes() -> Vec<String> {
+    vec![".git/".into(), ".DS_Store".into(), "Thumbs.db".into()]
 }
 
 impl RepoConfig {
@@ -235,6 +243,7 @@ mod tests {
             pack: PackConfig::default(),
             encrypted: false,
             key_verifier: None,
+            exclude: default_excludes(),
         }
     }
 
@@ -250,6 +259,7 @@ mod tests {
         let decoded: RepoConfig = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.pack.threshold, config.pack.threshold);
         assert!(!decoded.encrypted);
+        assert!(decoded.exclude.is_empty());
     }
 
     #[test]

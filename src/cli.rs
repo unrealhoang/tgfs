@@ -37,12 +37,19 @@ pub enum Command {
         key: KeyArgs,
     },
     /// Show local changes and the local vs remote index version
-    Status,
+    Status {
+        /// List every changed path instead of capping each category
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Push new/changed files to Telegram and pin a new index snapshot
     Push {
         /// Push even if the remote index is newer (overwrites remote state)
         #[arg(long)]
         force: bool,
+        /// Print one completion line per uploaded file
+        #[arg(short, long)]
+        verbose: bool,
         #[command(flatten)]
         key: KeyArgs,
     },

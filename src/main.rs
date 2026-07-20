@@ -33,17 +33,21 @@ async fn main() -> Result<()> {
         Command::Login => login().await,
         Command::Genkey { path } => generate_keyfile(&path),
         Command::Init { encrypt, key } => init(encrypt, key.load()?).await,
-        Command::Status => {
+        Command::Status { verbose } => {
             let context = open_repo().await?;
-            sync::status(&context).await
+            sync::status(&context, verbose).await
         }
-        Command::Push { force, key } => {
+        Command::Push {
+            force,
+            verbose,
+            key,
+        } => {
             let key = key.load()?;
             let mut context = open_repo().await?;
             if configure_repo_encryption(&mut context.repo, key.as_ref())? {
                 context.repo.save_config()?;
             }
-            sync::push(&mut context, force, key.as_ref()).await
+            sync::push(&mut context, force, verbose, key.as_ref()).await
         }
         Command::Pull { force, key } => {
             let key = key.load()?;
@@ -176,6 +180,7 @@ async fn init(encrypt: bool, supplied_key: Option<[u8; 32]>) -> Result<()> {
             pack: config::PackConfig::default(),
             encrypted: encrypt || remote_encrypted,
             key_verifier: effective_key.map(key::verifier),
+            exclude: config::default_excludes(),
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -257,6 +262,7 @@ async fn clone(name: &str, dir: Option<PathBuf>, key: Option<[u8; 32]>) -> Resul
             pack: config::PackConfig::default(),
             encrypted,
             key_verifier: key.as_ref().map(key::verifier),
+            exclude: config::default_excludes(),
         },
     )?;
     let mut index = Index::open(&repo.index_path())?;
@@ -361,6 +367,7 @@ mod cli_tests {
                 pack: config::PackConfig::default(),
                 encrypted,
                 key_verifier: verifier,
+                exclude: config::default_excludes(),
             },
         }
     }
@@ -370,6 +377,8 @@ mod cli_tests {
         let key = encoded_key(7);
         assert!(Cli::try_parse_from(["tgfs", "genkey", "key.txt"]).is_ok());
         assert!(Cli::try_parse_from(["tgfs", "push"]).is_ok());
+        assert!(Cli::try_parse_from(["tgfs", "push", "-v"]).is_ok());
+        assert!(Cli::try_parse_from(["tgfs", "status", "--verbose"]).is_ok());
         assert!(Cli::try_parse_from(["tgfs", "sync"]).is_err());
         assert!(Cli::try_parse_from(["tgfs", "key"]).is_err());
         assert!(

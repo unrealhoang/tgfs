@@ -1,10 +1,12 @@
 //! Synchronization coordinator for local changes and remote index versions.
 
-use std::sync::Arc;
-
 use std::collections::HashSet;
+use std::io::{IsTerminal as _, Write as _};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use grammers_client::session::types::PeerRef;
 
 use crate::context::RepoContext;
@@ -47,6 +49,7 @@ async fn flush_pack(
     peer: PeerRef,
     pending: &mut PendingPack,
     crypto: Option<&Arc<Crypto>>,
+    verbose: bool,
 ) -> Result<(usize, u64)> {
     if pending.is_empty() {
         return Ok((0, 0));
@@ -57,7 +60,9 @@ async fn flush_pack(
     let uploaded_files = pack.files.len();
     for entry in pack.files {
         context.index.upsert_file(&entry)?;
-        println!("✓ {}", entry.path);
+        if verbose {
+            println!("✓ {}", entry.path);
+        }
     }
     Ok((uploaded_files, uploaded_bytes))
 }
@@ -100,41 +105,169 @@ impl VersionState {
     }
 }
 
-/// Print working-tree changes and the local/remote version comparison.
-pub async fn status(context: &RepoContext) -> Result<()> {
-    let peer = context.tg.peer(&context.repo.config)?;
-    let state = VersionState::of(
-        context.index.version()?,
-        context.tg.remote_index_info(peer).await?,
-    );
-    println!("{}", state.describe());
+const STATUS_PATH_LIMIT: usize = 20;
 
-    let changes = diff::scan_changes(&context.repo, &context.index)?;
-    if changes.is_clean() {
-        println!("working tree clean ({} files indexed)", changes.unchanged);
-        return Ok(());
+struct StatusReporter {
+    verbose: bool,
+    progress: bool,
+    changes: diff::Changes,
+    new: Vec<String>,
+    modified: Vec<String>,
+    deleted: Vec<String>,
+}
+
+impl StatusReporter {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            progress: std::io::stderr().is_terminal(),
+            changes: diff::Changes::default(),
+            new: Vec::new(),
+            modified: Vec::new(),
+            deleted: Vec::new(),
+        }
     }
-    for path in &changes.new {
-        println!("  new:      {path}");
+
+    fn path(&mut self, kind: &str, path: String) {
+        if self.verbose {
+            println!("  {kind:<9}{path}");
+            return;
+        }
+        let paths = match kind {
+            "new:" => &mut self.new,
+            "modified:" => &mut self.modified,
+            "deleted:" => &mut self.deleted,
+            _ => unreachable!("known status category"),
+        };
+        if paths.len() < STATUS_PATH_LIMIT {
+            paths.push(path);
+        }
     }
-    for path in &changes.modified {
-        println!("  modified: {path}");
+
+    fn event(&mut self, event: diff::ScanEvent) {
+        match event {
+            diff::ScanEvent::New(file) => {
+                self.changes.new += 1;
+                self.path("new:", file.rel_path);
+            }
+            diff::ScanEvent::Modified(file) => {
+                self.changes.modified += 1;
+                self.path("modified:", file.rel_path);
+            }
+            diff::ScanEvent::Unchanged(file) => {
+                drop(file);
+                self.changes.unchanged += 1;
+            }
+            diff::ScanEvent::Deleted(path) => {
+                self.changes.deleted += 1;
+                self.path("deleted:", path);
+            }
+            diff::ScanEvent::Progress(stats) if self.progress => {
+                let changed = self.changes.new + self.changes.modified + self.changes.deleted;
+                eprint!(
+                    "\r\x1b[2Kscanning… {} files ({}), {} changed",
+                    stats.scanned,
+                    human_size(stats.bytes),
+                    changed
+                );
+                let _ = std::io::stderr().flush();
+            }
+            diff::ScanEvent::Progress(_) => {}
+        }
     }
-    for path in &changes.deleted {
-        println!("  deleted:  {path}");
+
+    fn finish(self) -> diff::Changes {
+        clear_progress(self.progress);
+        if !self.verbose {
+            print_category("new:", &self.new, self.changes.new);
+            print_category("modified:", &self.modified, self.changes.modified);
+            print_category("deleted:", &self.deleted, self.changes.deleted);
+        }
+        if self.changes.is_clean() {
+            println!(
+                "0 new, 0 modified, 0 deleted, {} unchanged — working tree clean",
+                self.changes.unchanged
+            );
+        } else {
+            println!(
+                "{} new, {} modified, {} deleted, {} unchanged — run `tgfs push` to upload",
+                self.changes.new,
+                self.changes.modified,
+                self.changes.deleted,
+                self.changes.unchanged
+            );
+        }
+        self.changes
     }
-    println!(
-        "{} new, {} modified, {} deleted, {} unchanged — run `tgfs push` to upload",
-        changes.new.len(),
-        changes.modified.len(),
-        changes.deleted.len(),
-        changes.unchanged
-    );
+}
+
+fn print_category(label: &str, paths: &[String], total: u64) {
+    for path in paths {
+        println!("  {label:<9}{path}");
+    }
+    let omitted = total.saturating_sub(paths.len() as u64);
+    if omitted > 0 {
+        println!("  {label:<9}… and {omitted} more (use -v to list all)");
+    }
+}
+
+fn clear_progress(enabled: bool) {
+    if enabled {
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn status_scan(
+    repo: crate::config::Repo,
+    index_path: PathBuf,
+    verbose: bool,
+) -> Result<diff::Changes> {
+    let index = crate::index::Index::open(&index_path)?;
+    let mut reporter = StatusReporter::new(verbose);
+    diff::scan(&repo, &index, |event| {
+        reporter.event(event);
+        Ok(())
+    })?;
+    Ok(reporter.finish())
+}
+
+/// Print working-tree changes and the local/remote version comparison.
+pub async fn status(context: &RepoContext, verbose: bool) -> Result<()> {
+    let peer = context.tg.peer(&context.repo.config)?;
+    let local_version = context.index.version()?;
+    let repo = context.repo.clone();
+    let index_path = context.repo.index_path();
+    let scan_task = tokio::task::spawn_blocking(move || status_scan(repo, index_path, verbose));
+    let (scan_result, remote) = tokio::join!(scan_task, context.tg.remote_index_info(peer));
+    scan_result.context("working-tree scan task failed")??;
+    let state = VersionState::of(local_version, remote?);
+    println!("{}", state.describe());
     Ok(())
 }
 
 /// Push the repo into its channel, guarded by the version check.
-pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>) -> Result<()> {
+pub async fn push(
+    context: &mut RepoContext,
+    force: bool,
+    verbose: bool,
+    key: Option<&[u8; 32]>,
+) -> Result<()> {
     let peer = context.tg.peer(&context.repo.config)?;
     let crypto = key.map(Crypto::new).map(Arc::new);
     if context.repo.config.encrypted && crypto.is_none() {
@@ -155,21 +288,50 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
     }
     let next_version = local_version.max(remote.map(|info| info.version).unwrap_or(0)) + 1;
 
-    let mut alive = Vec::new();
     let mut uploaded_files = 0usize;
     let mut uploaded_bytes = 0u64;
     let mut skipped = 0usize;
+    let mut tombstoned = 0usize;
+    let mut changed = 0u64;
     let mut pending_pack = PendingPack::default();
+    let show_progress = std::io::stderr().is_terminal();
+    let mut last_progress = None::<Instant>;
 
-    for local_file in diff::walk_repo(&context.repo)? {
-        alive.push(local_file.rel_path.clone());
-        if let Some(existing) = context.index.get_file(&local_file.rel_path)?
-            && !existing.deleted
-            && existing.size == local_file.size
-            && existing.mtime == local_file.mtime
+    for event in diff::Scanner::new(&context.repo, &context.index)? {
+        let local_file = match event? {
+            diff::ScanEvent::Unchanged(file) => {
+                drop(file);
+                skipped += 1;
+                continue;
+            }
+            diff::ScanEvent::Deleted(path) => {
+                tombstoned += usize::from(context.index.tombstone_file(&path)?);
+                continue;
+            }
+            diff::ScanEvent::Progress(stats) => {
+                if show_progress {
+                    eprint!(
+                        "\r\x1b[2Kpushing… {} files scanned ({}), {changed} changed, {uploaded_files} uploaded",
+                        stats.scanned,
+                        human_size(stats.bytes)
+                    );
+                    let _ = std::io::stderr().flush();
+                    last_progress = Some(Instant::now());
+                }
+                continue;
+            }
+            diff::ScanEvent::New(file) | diff::ScanEvent::Modified(file) => file,
+        };
+        changed += 1;
+        if show_progress
+            && last_progress.is_none_or(|last| last.elapsed() >= Duration::from_millis(500))
         {
-            skipped += 1;
-            continue;
+            eprint!(
+                "\r\x1b[2Kuploading… {} ({changed} changed, {uploaded_files} uploaded)",
+                local_file.rel_path
+            );
+            let _ = std::io::stderr().flush();
+            last_progress = Some(Instant::now());
         }
 
         if context.repo.config.pack.threshold > 0
@@ -179,13 +341,17 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
             let Some(chunk_hash) = entry.chunks.first() else {
                 context.index.upsert_file(&entry)?;
                 uploaded_files += 1;
-                println!("✓ {}", local_file.rel_path);
+                if verbose {
+                    println!("✓ {}", local_file.rel_path);
+                }
                 continue;
             };
             if context.index.chunk(chunk_hash)?.is_some() {
                 context.index.upsert_file(&entry)?;
                 uploaded_files += 1;
-                println!("✓ {}", local_file.rel_path);
+                if verbose {
+                    println!("✓ {}", local_file.rel_path);
+                }
                 continue;
             }
 
@@ -197,7 +363,8 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
                 };
                 if pending_pack.would_exceed(stored_len, context.repo.config.pack.target_size) {
                     let (files, bytes) =
-                        flush_pack(context, peer, &mut pending_pack, crypto.as_ref()).await?;
+                        flush_pack(context, peer, &mut pending_pack, crypto.as_ref(), verbose)
+                            .await?;
                     uploaded_files += files;
                     uploaded_bytes += bytes;
                 }
@@ -226,14 +393,17 @@ pub async fn push(context: &mut RepoContext, force: bool, key: Option<&[u8; 32]>
         uploaded_bytes += uploaded.uploaded_bytes;
         context.index.upsert_file(&uploaded.entry)?;
         uploaded_files += 1;
-        println!("✓ {}", local_file.rel_path);
+        if verbose {
+            println!("✓ {}", local_file.rel_path);
+        }
     }
 
-    let (files, bytes) = flush_pack(context, peer, &mut pending_pack, crypto.as_ref()).await?;
+    let (files, bytes) =
+        flush_pack(context, peer, &mut pending_pack, crypto.as_ref(), verbose).await?;
     uploaded_files += files;
     uploaded_bytes += bytes;
 
-    let tombstoned = context.index.tombstone_missing("", &alive)?;
+    clear_progress(show_progress);
     println!(
         "push done: {uploaded_files} uploaded ({uploaded_bytes} bytes), \
          {skipped} unchanged, {tombstoned} tombstoned"

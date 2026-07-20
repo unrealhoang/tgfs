@@ -21,6 +21,7 @@ const UPLOAD_CONCURRENCY_RECOVERY_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60);
 const UPLOAD_QUEUE_CAPACITY: usize = 64;
 const MAX_UPLOAD_RETRIES: u32 = 5;
+const MAX_FULL_UPLOAD_RESTARTS: u32 = 1;
 const MAX_FLOOD_WAIT: u64 = 30 * 60;
 
 /// Handle to one background upload scheduler. Callers submit work through the
@@ -62,6 +63,45 @@ struct UploadControl {
     concurrency: usize,
     resume_at: Option<tokio::time::Instant>,
     recover_at: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MissingPartAction {
+    Repair,
+    Restart,
+    Abort,
+}
+
+fn missing_file_part(error: &grammers_client::InvocationError) -> Option<i32> {
+    match error {
+        grammers_client::InvocationError::Rpc(rpc)
+            if rpc.code == 400 && rpc.name == "FILE_PART_MISSING" =>
+        {
+            rpc.value.and_then(|part| i32::try_from(part).ok())
+        }
+        _ => None,
+    }
+}
+
+fn missing_part_action(
+    missing_part: i32,
+    total_parts: i32,
+    attempt_start: i32,
+    repaired_part: Option<i32>,
+    full_restarts: u32,
+) -> MissingPartAction {
+    if !(0..total_parts).contains(&missing_part) {
+        return MissingPartAction::Abort;
+    }
+    if missing_part < attempt_start || repaired_part.is_some() {
+        if full_restarts < MAX_FULL_UPLOAD_RESTARTS {
+            MissingPartAction::Restart
+        } else {
+            MissingPartAction::Abort
+        }
+    } else {
+        MissingPartAction::Repair
+    }
 }
 
 impl UploadControl {
@@ -505,7 +545,9 @@ impl Tg {
         }
         let _transfer = self.begin_upload();
         let uploaded = self.uploader.small_file(bytes, name).await?;
-        self.send_uploaded(peer, uploaded, caption).await
+        self.send_uploaded(peer, uploaded, caption)
+            .await
+            .context("failed to send document message")
     }
 
     async fn send_uploaded(
@@ -513,7 +555,7 @@ impl Tg {
         peer: PeerRef,
         uploaded: grammers_client::media::Uploaded,
         caption: &str,
-    ) -> Result<i32> {
+    ) -> std::result::Result<i32, grammers_client::InvocationError> {
         let message = self
             .client
             .send_message(
@@ -523,50 +565,48 @@ impl Tg {
                     .mime_type("application/octet-stream")
                     .document(uploaded),
             )
-            .await
-            .context("failed to send document message")?;
+            .await?;
         Ok(message.id())
     }
 
-    /// Upload a source, using resumable parallel parts for large files.
-    pub async fn upload_source(
+    async fn upload_big_part(
         &self,
-        peer: PeerRef,
-        source: Arc<dyn PartSource>,
-        name: String,
-        caption: &str,
-        resume: Option<(i64, i32)>,
-        mut on_progress: impl FnMut(i64, i32) -> Result<()>,
-    ) -> Result<i32> {
-        let _transfer = self.begin_upload();
-        let len = source.len();
-        if len == 0 {
-            bail!("refusing to upload an empty document");
-        }
-
-        if len <= BIG_FILE_THRESHOLD {
-            let mut buf = vec![0u8; len as usize];
-            source.read_at(0, &mut buf)?;
-            let uploaded = self.uploader.small_file(buf, name).await?;
-            return self.send_uploaded(peer, uploaded, caption).await;
-        }
-
-        let total = total_parts(len);
-        let (file_id, start) = match resume {
-            Some((id, done)) => {
-                println!("    resuming upload at part {done}/{total}");
-                (id, done)
-            }
-            None => (rand::random::<i64>(), 0),
+        source: &Arc<dyn PartSource>,
+        file_id: i64,
+        total: i32,
+        part: i32,
+    ) -> Result<()> {
+        let request = tl::functions::upload::SaveBigFilePart {
+            file_id,
+            file_part: part,
+            file_total_parts: total,
+            bytes: source.read_part(part)?,
         };
-        on_progress(file_id, start)?;
+        let ok = self
+            .uploader
+            .big_part(request)
+            .await
+            .with_context(|| format!("failed to upload part {part}/{total}"))?;
+        if !ok {
+            bail!("Telegram rejected part {part}/{total}");
+        }
+        Ok(())
+    }
 
+    async fn upload_big_parts(
+        &self,
+        source: &Arc<dyn PartSource>,
+        file_id: i64,
+        total: i32,
+        start: i32,
+        on_progress: &mut impl FnMut(i64, i32) -> Result<()>,
+    ) -> Result<()> {
         let next = Arc::new(std::sync::atomic::AtomicI32::new(start));
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut producers = tokio::task::JoinSet::new();
         for _ in 0..INITIAL_UPLOAD_CONCURRENCY {
             let uploader = self.uploader.clone();
-            let source = Arc::clone(&source);
+            let source = Arc::clone(source);
             let next = Arc::clone(&next);
             let done_tx = done_tx.clone();
             producers.spawn(async move {
@@ -575,12 +615,11 @@ impl Tg {
                     if part >= total {
                         return Ok(());
                     }
-                    let bytes = source.read_part(part)?;
                     let request = tl::functions::upload::SaveBigFilePart {
                         file_id,
                         file_part: part,
                         file_total_parts: total,
-                        bytes,
+                        bytes: source.read_part(part)?,
                     };
                     let ok = uploader
                         .big_part(request)
@@ -635,15 +674,113 @@ impl Tg {
         if watermark != total {
             bail!("upload incomplete: {watermark}/{total} parts confirmed");
         }
+        Ok(())
+    }
 
-        let uploaded = grammers_client::media::Uploaded {
-            raw: tl::enums::InputFile::Big(tl::types::InputFileBig {
-                id: file_id,
-                parts: total,
-                name,
-            }),
+    /// Upload a source, using resumable parallel parts for large files.
+    pub async fn upload_source(
+        &self,
+        peer: PeerRef,
+        source: Arc<dyn PartSource>,
+        name: String,
+        caption: &str,
+        resume: Option<(i64, i32)>,
+        mut on_progress: impl FnMut(i64, i32) -> Result<()>,
+    ) -> Result<i32> {
+        let _transfer = self.begin_upload();
+        let len = source.len();
+        if len == 0 {
+            bail!("refusing to upload an empty document");
+        }
+
+        if len <= BIG_FILE_THRESHOLD {
+            let mut buf = vec![0u8; len as usize];
+            source.read_at(0, &mut buf)?;
+            let uploaded = self.uploader.small_file(buf, name).await?;
+            return self
+                .send_uploaded(peer, uploaded, caption)
+                .await
+                .context("failed to send document message");
+        }
+
+        let total = total_parts(len);
+        let (mut file_id, mut start) = match resume {
+            Some((id, done)) => {
+                println!("    resuming upload at part {done}/{total}");
+                (id, done)
+            }
+            None => (rand::random::<i64>(), 0),
         };
-        self.send_uploaded(peer, uploaded, caption).await
+        let mut full_restarts = 0;
+
+        loop {
+            on_progress(file_id, start)?;
+            self.upload_big_parts(&source, file_id, total, start, &mut on_progress)
+                .await?;
+
+            let mut repaired_part = None;
+            loop {
+                let uploaded = grammers_client::media::Uploaded {
+                    raw: tl::enums::InputFile::Big(tl::types::InputFileBig {
+                        id: file_id,
+                        parts: total,
+                        name: name.clone(),
+                    }),
+                };
+                match self.send_uploaded(peer, uploaded, caption).await {
+                    Ok(message_id) => return Ok(message_id),
+                    Err(error) => {
+                        let Some(missing_part) = missing_file_part(&error) else {
+                            return Err(anyhow::Error::new(error)
+                                .context("failed to send document message"));
+                        };
+                        match missing_part_action(
+                            missing_part,
+                            total,
+                            start,
+                            repaired_part,
+                            full_restarts,
+                        ) {
+                            MissingPartAction::Repair => {
+                                crate::tg::clear_progress_line();
+                                tracing::warn!(
+                                    operation = "upload",
+                                    file_id,
+                                    missing_part,
+                                    "Telegram lost an uploaded file part; re-uploading it before retrying sendMedia"
+                                );
+                                self.upload_big_part(&source, file_id, total, missing_part)
+                                    .await?;
+                                repaired_part = Some(missing_part);
+                            }
+                            MissingPartAction::Restart => {
+                                let old_file_id = file_id;
+                                file_id = rand::random::<i64>();
+                                while file_id == old_file_id {
+                                    file_id = rand::random::<i64>();
+                                }
+                                start = 0;
+                                full_restarts += 1;
+                                crate::tg::clear_progress_line();
+                                tracing::warn!(
+                                    operation = "upload",
+                                    old_file_id,
+                                    file_id,
+                                    missing_part,
+                                    "Telegram lost multiple or previously journaled file parts; restarting upload with a new file id"
+                                );
+                                break;
+                            }
+                            MissingPartAction::Abort => {
+                                return Err(anyhow::Error::new(error).context(
+                                    "Telegram still reports missing file parts after repair and a full restart; reduce pack.target_size",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Resolve one document message. Callers restoring packed files can cache
@@ -771,6 +908,54 @@ mod tests {
             Some(14)
         );
         assert_eq!(flood_wait(&rpc_error(500, "INTERNAL", None)), None);
+    }
+
+    #[test]
+    fn recognizes_missing_file_part() {
+        assert_eq!(
+            missing_file_part(&rpc_error(400, "FILE_PART_MISSING", Some(1332))),
+            Some(1332)
+        );
+        assert_eq!(
+            missing_file_part(&rpc_error(400, "FILE_PART_INVALID", Some(1332))),
+            None
+        );
+        assert_eq!(
+            missing_file_part(&rpc_error(400, "FILE_PART_MISSING", None)),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_part_recovery_repairs_once_then_restarts() {
+        assert_eq!(
+            missing_part_action(60, 100, 50, None, 0),
+            MissingPartAction::Repair
+        );
+        assert_eq!(
+            missing_part_action(61, 100, 50, Some(60), 0),
+            MissingPartAction::Restart
+        );
+    }
+
+    #[test]
+    fn missing_journaled_part_restarts_without_repair() {
+        assert_eq!(
+            missing_part_action(49, 100, 50, None, 0),
+            MissingPartAction::Restart
+        );
+    }
+
+    #[test]
+    fn missing_part_recovery_is_bounded() {
+        assert_eq!(
+            missing_part_action(61, 100, 0, Some(60), MAX_FULL_UPLOAD_RESTARTS),
+            MissingPartAction::Abort
+        );
+        assert_eq!(
+            missing_part_action(100, 100, 0, None, 0),
+            MissingPartAction::Abort
+        );
     }
 
     #[test]

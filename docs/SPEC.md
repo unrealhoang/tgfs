@@ -63,7 +63,9 @@ stable message IDs, and access control.
   for the server-requested delay (up to 30 minutes) and reduces concurrency
   from four to one. Successful uploads then restore one slot per
   throttle-free minute; another flood resets the limit to one. Transient I/O
-  errors retry with exponential backoff.
+  errors retry with exponential backoff. Finalization repairs one
+  `FILE_PART_X_MISSING`; a missing journaled-prefix part or a second missing
+  part restarts the upload once under a fresh file id.
 - Optional client-side encryption (`tgfs init --encrypt`), since Telegram
   cloud chats are not E2E-encrypted: XChaCha20-Poly1305 over independent
   1 MiB segments, with nonces derived (keyed BLAKE3) from the chunk's

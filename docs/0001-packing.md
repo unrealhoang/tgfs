@@ -248,7 +248,12 @@ into one ranged read, but it is not required for correctness.
   per-member ciphertext guarantees identical bytes. If the pending set
   differs (a member changed, was added, or already landed elsewhere) the
   pack hash differs, no journal entry matches, and packing simply starts
-  fresh — correctness never depends on resume. (As with chunks today,
+  fresh — correctness never depends on resume. During final `sendMedia`, a
+  `FILE_PART_X_MISSING` for a part uploaded in the current run is repaired
+  once. A missing part from the journaled prefix, or a second missing part,
+  discards the temporary Telegram file id and restarts the pack from zero;
+  one full restart is allowed before returning an error that recommends a
+  smaller `pack.target_size`. (As with chunks today,
   packs under the 10 MiB big-file threshold take `upload_source`'s
   one-shot path and never journal; a failure just re-uploads.)
 - **Crash after upload, before index insert**: the pack message is

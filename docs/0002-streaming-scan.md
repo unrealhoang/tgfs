@@ -176,10 +176,9 @@ walker, the stat map, and the SQLite connection all live in one stack
 frame) and is sufficient for both consumers. `Changes` shrinks to
 counters; the path lists live only in the events.
 
-**`status`** prints changed paths *as they are discovered* (matching
-today's output format, now incremental) and renders progress lines
-between them. Deletions still print last — unavoidable, since they are
-only known once the walk ends.
+**`status`** consumes the events for counters and (capped) path
+listing; what it prints is governed by §3.4a. Deletions are only known
+once the walk ends, so any deleted-path output comes last.
 
 **`push`** replaces its `walk_repo` loop body (`src/sync.rs:164`) with a
 match on events: `Unchanged` → `skipped += 1`; `New`/`Modified` → the
@@ -191,6 +190,34 @@ in the repo). Uploads mutate the index (`upsert_file`, `insert_chunks`)
 while the preloaded stat map is already in memory — safe, because the
 map is a snapshot of *pre-push* state, which is exactly what the diff
 must be computed against.
+
+### 3.4a Output at scale: counts are the status, paths are a query
+
+Today `status` prints one line per changed path. At Immich scale that is
+its own failure mode: 50 000 `new:` lines scroll the summary away and
+are unreadable regardless of how fast the scan got.
+
+restic's stance is instructive: `backup` **never enumerates files by
+default** — the default UI is the live status display plus a fixed-size
+summary (`Files: 10 new, 2 changed, 993k unmodified`); per-file lines
+exist only under `--verbose=2`, and "which files changed" is a separate
+on-demand command (`restic diff`). Counts are the status; the
+enumeration is a query.
+
+`status` adopts the same split:
+
+- **Default**: print up to `LIMIT` (20) changed paths per category, then
+  `… and N more (use -v to list all)`, then the summary line. Small
+  repos look exactly like today; large repos stay one screenful.
+- **`status -v`**: print every path, streamed as discovered — the output
+  is line-oriented and pipeable, serving the `restic diff` role.
+- The summary counters line stays unconditional in both modes.
+
+`push`'s per-file `✓ path` echo (`src/sync.rs:60,229`) has the same
+problem plus its inverse under packing: an all-unchanged run prints
+nothing for the entire walk. It moves to the same model: the throttled
+progress line (§3.4) carries `uploaded/changed` counts and the file
+currently uploading; per-file `✓` lines become `-v` only.
 
 ### 3.4 Progress reporting
 

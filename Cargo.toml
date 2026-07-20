@@ -29,6 +29,7 @@ grammers-client = "0.10.0"
 grammers-session = { version = "0.10.0", default-features = false }
 grammers-tl-types = "0.10.0"
 ignore = "0.4.23"
+jwalk = "0.8.1"
 rand = "0.10.2"
 rpassword = "7.5.4"
 rusqlite = { workspace = true, features = ["bundled"] }

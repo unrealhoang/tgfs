@@ -50,6 +50,7 @@ impl Tg {
         name: String,
         caption: &str,
     ) -> Result<i32> {
+        let _transfer = self.begin_upload();
         let uploaded = self
             .client
             .upload_stream(stream, size, name)
@@ -88,6 +89,7 @@ impl Tg {
         resume: Option<(i64, i32)>,
         mut on_progress: impl FnMut(i64, i32) -> Result<()>,
     ) -> Result<i32> {
+        let _transfer = self.begin_upload();
         let len = source.len();
         if len == 0 {
             bail!("refusing to upload an empty document");
@@ -183,6 +185,7 @@ impl Tg {
     /// Resolve one document message. Callers restoring packed files can cache
     /// this value so all members of a pack share one message lookup.
     pub async fn document(&self, peer: PeerRef, msg_id: i32) -> Result<Document> {
+        let _transfer = self.begin_download();
         let messages = self.client.get_messages_by_id(peer, &[msg_id]).await?;
         let message = messages
             .into_iter()
@@ -207,6 +210,7 @@ impl Tg {
         len: u64,
         out: &mut W,
     ) -> Result<u64> {
+        let _transfer = self.begin_download();
         offset
             .checked_add(len)
             .context("ranged download offset overflow")?;
@@ -241,6 +245,7 @@ impl Tg {
         msg_id: i32,
         out: &mut W,
     ) -> Result<u64> {
+        let _transfer = self.begin_download();
         let document = self.document(peer, msg_id).await?;
         let mut total = 0u64;
         let mut download = self.client.iter_download(&document);

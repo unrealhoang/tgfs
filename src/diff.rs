@@ -2,10 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use ignore::gitignore::GitignoreBuilder;
 use ignore::overrides::OverrideBuilder;
+use jwalk::Parallelism;
 
 use crate::config::{REPO_DIR, Repo};
 use crate::index::Index;
@@ -37,6 +40,7 @@ impl Changes {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScanStats {
     pub(crate) scanned: u64,
+    pub(crate) dirs: u64,
     pub(crate) bytes: u64,
 }
 
@@ -48,15 +52,20 @@ pub(crate) enum ScanEvent {
     Progress(ScanStats),
 }
 
-/// Lazy filesystem iterator. The `ignore` walker applies exclusions before it
-/// descends into a directory and sorts only the directory currently visited.
-pub(crate) struct LocalFiles {
+/// Lazy filesystem iterator. `jwalk` reads directories in parallel while
+/// yielding their entries in deterministic depth-first order.
+struct LocalFiles {
     root: PathBuf,
-    walk: ignore::Walk,
+    walk: jwalk::DirEntryIter<((), ())>,
+}
+
+enum LocalEntry {
+    File(LocalFile),
+    Directory,
 }
 
 impl Iterator for LocalFiles {
-    type Item = Result<LocalFile>;
+    type Item = Result<LocalEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -64,10 +73,13 @@ impl Iterator for LocalFiles {
                 Ok(entry) => entry,
                 Err(error) => return Some(Err(error.into())),
             };
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            if entry.file_type().is_dir() {
+                return Some(Ok(LocalEntry::Directory));
+            }
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let path = entry.into_path();
+            let path = entry.path();
             let file = (|| {
                 let rel = path.strip_prefix(&self.root).with_context(|| {
                     format!("{} is outside repo {}", path.display(), self.root.display())
@@ -80,19 +92,19 @@ impl Iterator for LocalFiles {
                     .duration_since(UNIX_EPOCH)
                     .map(|duration| duration.as_secs() as i64)
                     .unwrap_or(0);
-                Ok(LocalFile {
+                Ok(LocalEntry::File(LocalFile {
                     rel_path: rel.to_string_lossy().replace('\\', "/"),
                     abs_path: path,
                     size: meta.len(),
                     mtime,
-                })
+                }))
             })();
             return Some(file);
         }
     }
 }
 
-pub(crate) fn walk_repo(repo: &Repo) -> Result<LocalFiles> {
+fn walk_builder(repo: &Repo, parallelism: Parallelism) -> Result<jwalk::WalkDirGeneric<((), ())>> {
     let mut overrides = OverrideBuilder::new(&repo.root);
     for pattern in &repo.config.exclude {
         // Override globs use `!` for exclusions. Keeping these as overrides
@@ -101,17 +113,60 @@ pub(crate) fn walk_repo(repo: &Repo) -> Result<LocalFiles> {
             .add(&format!("!{pattern}"))
             .with_context(|| format!("invalid exclude pattern {pattern:?}"))?;
     }
+    let overrides = Arc::new(overrides.build()?);
 
-    let mut builder = ignore::WalkBuilder::new(&repo.root);
-    builder
-        .standard_filters(false)
-        .add_custom_ignore_filename(".tgfsignore")
-        .overrides(overrides.build()?)
-        .filter_entry(|entry| entry.file_name() != REPO_DIR)
-        .sort_by_file_name(|left, right| left.cmp(right));
+    let root_ignore = repo.root.join(".tgfsignore");
+    let mut ignore_builder = GitignoreBuilder::new(&repo.root);
+    if root_ignore
+        .try_exists()
+        .with_context(|| format!("cannot access {}", root_ignore.display()))?
+        && let Some(error) = ignore_builder.add(&root_ignore)
+    {
+        return Err(error).with_context(|| format!("invalid {}", root_ignore.display()));
+    }
+    let root_ignore = Arc::new(ignore_builder.build()?);
+
+    Ok(jwalk::WalkDirGeneric::<((), ())>::new(&repo.root)
+        .parallelism(parallelism)
+        .skip_hidden(false)
+        .sort(true)
+        .process_read_dir(move |_depth, _path, _state, children| {
+            children.retain(|result| {
+                let Ok(entry) = result else {
+                    return true;
+                };
+                if entry.file_name == REPO_DIR {
+                    return false;
+                }
+                let is_dir = entry.file_type.is_dir();
+                let path = entry.path();
+                if overrides.matched(&path, is_dir).is_ignore() {
+                    return false;
+                }
+                !root_ignore
+                    .matched_path_or_any_parents(&path, is_dir)
+                    .is_ignore()
+            });
+        }))
+}
+
+fn walk_repo(repo: &Repo) -> Result<LocalFiles> {
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(1, 8);
+    walk_repo_with(repo, Parallelism::RayonNewPool(threads))
+}
+
+fn walk_repo_serial(repo: &Repo) -> Result<LocalFiles> {
+    walk_repo_with(repo, Parallelism::Serial)
+}
+
+fn walk_repo_with(repo: &Repo, parallelism: Parallelism) -> Result<LocalFiles> {
+    let builder = walk_builder(repo, parallelism)?;
     Ok(LocalFiles {
         root: repo.root.clone(),
-        walk: builder.build(),
+        walk: builder.try_into_iter()?,
     })
 }
 
@@ -124,17 +179,29 @@ pub(crate) struct Scanner {
     stats: ScanStats,
     last_progress: Instant,
     pending_progress: bool,
+    finished: bool,
 }
 
 impl Scanner {
     pub(crate) fn new(repo: &Repo, index: &Index) -> Result<Self> {
+        Self::with_files(walk_repo(repo)?, index)
+    }
+
+    /// Serial traversal for push: jwalk's parallel prefetch queue is
+    /// unbounded, so it must not run ahead while the consumer awaits uploads.
+    pub(crate) fn new_for_push(repo: &Repo, index: &Index) -> Result<Self> {
+        Self::with_files(walk_repo_serial(repo)?, index)
+    }
+
+    fn with_files(files: LocalFiles, index: &Index) -> Result<Self> {
         Ok(Self {
-            files: walk_repo(repo)?,
+            files,
             previous: index.stat_map()?,
             deleted: None,
             stats: ScanStats::default(),
             last_progress: Instant::now(),
             pending_progress: false,
+            finished: false,
         })
     }
 }
@@ -149,35 +216,53 @@ impl Iterator for Scanner {
             return Some(Ok(ScanEvent::Progress(self.stats)));
         }
 
-        if let Some(deleted) = &mut self.deleted {
-            return deleted.next().map(|path| Ok(ScanEvent::Deleted(path)));
-        }
-
-        match self.files.next() {
-            Some(Err(error)) => Some(Err(error)),
-            Some(Ok(file)) => {
-                self.stats.scanned += 1;
-                self.stats.bytes += file.size;
-                if self.stats.scanned.is_multiple_of(256)
-                    && self.last_progress.elapsed() >= Duration::from_millis(500)
-                {
-                    self.pending_progress = true;
+        loop {
+            if let Some(deleted) = &mut self.deleted {
+                if let Some(path) = deleted.next() {
+                    return Some(Ok(ScanEvent::Deleted(path)));
                 }
-                let prior = self.previous.remove(&file.rel_path);
-                let event = match prior {
-                    Some((size, mtime)) if size == file.size && mtime == file.mtime => {
-                        ScanEvent::Unchanged(file)
-                    }
-                    Some(_) => ScanEvent::Modified(file),
-                    None => ScanEvent::New(file),
-                };
-                Some(Ok(event))
+                self.deleted = None;
+                self.finished = true;
+                return Some(Ok(ScanEvent::Progress(self.stats)));
             }
-            None => {
-                let mut deleted: Vec<_> = self.previous.drain().map(|(path, _)| path).collect();
-                deleted.sort();
-                self.deleted = Some(deleted.into_iter());
-                self.next()
+            if self.finished {
+                return None;
+            }
+
+            match self.files.next() {
+                Some(Err(error)) => return Some(Err(error)),
+                Some(Ok(LocalEntry::Directory)) => {
+                    self.stats.dirs += 1;
+                    if (self.stats.scanned + self.stats.dirs).is_multiple_of(256)
+                        && self.last_progress.elapsed() >= Duration::from_millis(500)
+                    {
+                        self.last_progress = Instant::now();
+                        return Some(Ok(ScanEvent::Progress(self.stats)));
+                    }
+                }
+                Some(Ok(LocalEntry::File(file))) => {
+                    self.stats.scanned += 1;
+                    self.stats.bytes += file.size;
+                    if (self.stats.scanned + self.stats.dirs).is_multiple_of(256)
+                        && self.last_progress.elapsed() >= Duration::from_millis(500)
+                    {
+                        self.pending_progress = true;
+                    }
+                    let prior = self.previous.remove(&file.rel_path);
+                    let event = match prior {
+                        Some((size, mtime)) if size == file.size && mtime == file.mtime => {
+                            ScanEvent::Unchanged(file)
+                        }
+                        Some(_) => ScanEvent::Modified(file),
+                        None => ScanEvent::New(file),
+                    };
+                    return Some(Ok(event));
+                }
+                None => {
+                    let mut deleted: Vec<_> = self.previous.drain().map(|(path, _)| path).collect();
+                    deleted.sort();
+                    self.deleted = Some(deleted.into_iter());
+                }
             }
         }
     }
@@ -260,10 +345,13 @@ mod tests {
         fs::write(root.join("same"), b"abc").unwrap();
         fs::write(root.join("changed"), b"longer").unwrap();
         fs::write(root.join("new"), b"new").unwrap();
+        fs::create_dir(root.join("empty")).unwrap();
         let same = walk_repo(&repo)
             .unwrap()
             .find_map(|file| {
-                let file = file.unwrap();
+                let LocalEntry::File(file) = file.unwrap() else {
+                    return None;
+                };
                 (file.rel_path == "same").then_some(file)
             })
             .unwrap();
@@ -274,13 +362,14 @@ mod tests {
         index.upsert_file(&indexed("deleted", 1, 0)).unwrap();
 
         let mut kinds = Vec::new();
+        let mut final_stats = ScanStats::default();
         let changes = scan(&repo, &index, |event| {
             match event {
                 ScanEvent::New(file) => kinds.push(format!("new:{}", file.rel_path)),
                 ScanEvent::Modified(file) => kinds.push(format!("modified:{}", file.rel_path)),
                 ScanEvent::Unchanged(file) => kinds.push(format!("same:{}", file.rel_path)),
                 ScanEvent::Deleted(path) => kinds.push(format!("deleted:{path}")),
-                ScanEvent::Progress(_) => {}
+                ScanEvent::Progress(stats) => final_stats = stats,
             }
             Ok(())
         })
@@ -294,13 +383,15 @@ mod tests {
                 unchanged: 1
             }
         );
+        assert_eq!(final_stats.scanned, 3);
+        assert_eq!(final_stats.dirs, 2);
         assert_eq!(kinds.last().unwrap(), "deleted:deleted");
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn config_and_tgfsignore_exclusions_become_deletions() {
+    fn config_and_root_tgfsignore_exclusions_become_deletions() {
         let (repo, mut index, root) = temp_repo(default_excludes());
         fs::create_dir(root.join(".git")).unwrap();
         fs::write(root.join(".git/objects"), b"ignored").unwrap();
@@ -326,11 +417,38 @@ mod tests {
         .unwrap();
         assert!(!paths.iter().any(|path| path.starts_with(".git/")));
         assert!(!paths.iter().any(|path| path == "skip.tmp"));
-        assert!(!paths.iter().any(|path| path == "nested/thumb.cache"));
+        assert!(paths.iter().any(|path| path == "nested/.tgfsignore"));
+        assert!(paths.iter().any(|path| path == "nested/thumb.cache"));
         assert!(paths.iter().any(|path| path == "git-ignored"));
         assert!(paths.iter().any(|path| path == "deleted:skip.tmp"));
         assert_eq!(changes.deleted, 1);
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parallel_and_serial_walks_have_the_same_depth_first_order() {
+        let (repo, index, root) = temp_repo(vec![]);
+        fs::create_dir(root.join("a")).unwrap();
+        fs::create_dir(root.join("z")).unwrap();
+        fs::write(root.join("a/2"), b"").unwrap();
+        fs::write(root.join("a/1"), b"").unwrap();
+        fs::write(root.join("b"), b"").unwrap();
+        fs::write(root.join("z/1"), b"").unwrap();
+
+        let collect = |walk: LocalFiles| {
+            walk.filter_map(|entry| match entry.unwrap() {
+                LocalEntry::File(file) => Some(file.rel_path),
+                LocalEntry::Directory => None,
+            })
+            .collect::<Vec<_>>()
+        };
+        let parallel = collect(walk_repo(&repo).unwrap());
+        let serial = collect(walk_repo_serial(&repo).unwrap());
+        assert_eq!(parallel, vec!["a/1", "a/2", "b", "z/1"]);
+        assert_eq!(parallel, serial);
+
+        drop(index);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -34,10 +34,15 @@ default, `status` lists at most 20 paths in each change category; use
 `tgfs status -v` to stream every changed path. `push -v` similarly enables
 one completion line per uploaded file. On a terminal, both commands show a
 throttled progress line on stderr, leaving stdout pipeable.
+Status overlaps directory reads with up to eight workers while preserving
+sorted depth-first output; push uses the same ordering without read-ahead
+during network uploads.
 
-Scans never apply `.gitignore` implicitly. Instead, tgfs reads
-`.tgfsignore` files (gitignore syntax) at any directory level and the
-`exclude` list in `.tgfs/config.toml`. Newly initialized repositories start
+Scans never apply `.gitignore` implicitly. Instead, tgfs reads one
+gitignore-syntax file at `<repo>/.tgfsignore` and the `exclude` list in
+`.tgfs/config.toml`. Nested `.tgfsignore` files are ordinary backed-up files;
+limiting discovery to the root avoids an extra metadata lookup in every
+directory. Newly initialized repositories start
 with these visible defaults:
 
 ```toml

@@ -1,7 +1,8 @@
 //! Telegram connection, authentication, channel discovery, and access control.
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use grammers_client::session::Session as _;
@@ -14,7 +15,29 @@ use crate::session::FileSession;
 /// Retry policy tuned for unattended backups: sleep out flood waits up to
 /// 30 minutes (Telegram tells us how long), retry a few times on transient
 /// I/O errors with exponential backoff.
-struct BackupRetry;
+#[derive(Default)]
+struct TransferActivity {
+    uploads: AtomicUsize,
+    downloads: AtomicUsize,
+}
+
+impl TransferActivity {
+    fn label(&self) -> &'static str {
+        match (
+            self.uploads.load(Ordering::SeqCst) > 0,
+            self.downloads.load(Ordering::SeqCst) > 0,
+        ) {
+            (true, false) => "upload",
+            (false, true) => "download",
+            (true, true) => "upload/download",
+            (false, false) => "Telegram request",
+        }
+    }
+}
+
+struct BackupRetry {
+    transfers: Arc<TransferActivity>,
+}
 
 impl grammers_client::client::RetryPolicy for BackupRetry {
     fn should_retry(
@@ -26,10 +49,30 @@ impl grammers_client::client::RetryPolicy for BackupRetry {
         match &ctx.error {
             grammers_client::InvocationError::Rpc(err) if err.code == 420 => {
                 let secs = err.value.unwrap_or(1) as u64;
+                let operation = self.transfers.label();
+                clear_progress_line();
                 if ctx.fail_count.get() <= 5 && secs <= 30 * 60 {
-                    tracing::warn!("flood wait: sleeping {secs}s before retrying");
-                    ControlFlow::Continue(Duration::from_secs(secs + 1))
+                    let delay = Duration::from_secs(secs.saturating_add(1));
+                    tracing::warn!(
+                        operation,
+                        server_wait_seconds = secs,
+                        wait_seconds = delay.as_secs(),
+                        "Telegram throttled {operation}; waiting {}s before retrying (server requested {secs}s)",
+                        delay.as_secs()
+                    );
+                    ControlFlow::Continue(delay)
                 } else {
+                    let reason = if secs > 30 * 60 {
+                        "server wait exceeds the 30-minute limit"
+                    } else {
+                        "retry-attempt limit exceeded"
+                    };
+                    tracing::warn!(
+                        operation,
+                        server_wait_seconds = secs,
+                        retry_attempt = ctx.fail_count.get(),
+                        "Telegram throttled {operation} for {secs}s; not retrying ({reason})"
+                    );
                     ControlFlow::Break(())
                 }
             }
@@ -41,12 +84,57 @@ impl grammers_client::client::RetryPolicy for BackupRetry {
     }
 }
 
+fn clear_progress_line() {
+    let mut stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let _ = write!(stderr, "\r\x1b[2K");
+        let _ = stderr.flush();
+    }
+}
+
 pub struct Tg {
     pub client: Client,
     session: Arc<FileSession>,
+    transfers: Arc<TransferActivity>,
+}
+
+#[derive(Clone, Copy)]
+enum TransferKind {
+    Upload,
+    Download,
+}
+
+pub(crate) struct TransferGuard {
+    transfers: Arc<TransferActivity>,
+    kind: TransferKind,
+}
+
+impl Drop for TransferGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            TransferKind::Upload => self.transfers.uploads.fetch_sub(1, Ordering::SeqCst),
+            TransferKind::Download => self.transfers.downloads.fetch_sub(1, Ordering::SeqCst),
+        };
+    }
 }
 
 impl Tg {
+    pub(crate) fn begin_upload(&self) -> TransferGuard {
+        self.transfers.uploads.fetch_add(1, Ordering::SeqCst);
+        TransferGuard {
+            transfers: Arc::clone(&self.transfers),
+            kind: TransferKind::Upload,
+        }
+    }
+
+    pub(crate) fn begin_download(&self) -> TransferGuard {
+        self.transfers.downloads.fetch_add(1, Ordering::SeqCst);
+        TransferGuard {
+            transfers: Arc::clone(&self.transfers),
+            kind: TransferKind::Download,
+        }
+    }
+
     /// Connect using the stored session. Does not log in by itself.
     pub async fn connect(api_id: i32) -> Result<Self> {
         let session = Arc::new(
@@ -54,15 +142,22 @@ impl Tg {
                 .map_err(|e| anyhow::anyhow!("cannot open session store: {e}"))?,
         );
         let pool = SenderPool::new(Arc::clone(&session), api_id);
+        let transfers = Arc::new(TransferActivity::default());
         let client = Client::with_configuration(
             pool.handle,
             grammers_client::client::ClientConfiguration {
-                retry_policy: Box::new(BackupRetry),
+                retry_policy: Box::new(BackupRetry {
+                    transfers: Arc::clone(&transfers),
+                }),
                 ..Default::default()
             },
         );
         tokio::spawn(pool.runner.run());
-        Ok(Self { client, session })
+        Ok(Self {
+            client,
+            session,
+            transfers,
+        })
     }
 
     /// Interactive login: phone → code → optional 2FA password.
@@ -312,4 +407,34 @@ fn prompt(msg: &str) -> Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_activity_labels_nested_operations() {
+        let transfers = Arc::new(TransferActivity::default());
+        assert_eq!(transfers.label(), "Telegram request");
+
+        let upload = TransferGuard {
+            transfers: Arc::clone(&transfers),
+            kind: TransferKind::Upload,
+        };
+        transfers.uploads.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(transfers.label(), "upload");
+
+        let download = TransferGuard {
+            transfers: Arc::clone(&transfers),
+            kind: TransferKind::Download,
+        };
+        transfers.downloads.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(transfers.label(), "upload/download");
+
+        drop(upload);
+        assert_eq!(transfers.label(), "download");
+        drop(download);
+        assert_eq!(transfers.label(), "Telegram request");
+    }
 }

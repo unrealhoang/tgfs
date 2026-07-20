@@ -71,28 +71,32 @@ Replace `walk_repo → Vec` + per-file `get_file` with:
 > `ScanEvent`s to a callback. `status` and `push` are both consumers
 > of the same event stream.
 
-### 3.1 Traversal: the `ignore` crate
+### 3.1 Traversal: `jwalk` with `ignore` matchers
 
-Swap `walkdir` for the `ignore` crate (ripgrep's walker):
+Use `jwalk` for ordered parallel directory reads while retaining the
+`ignore` crate's gitignore and override matchers:
 
 ```rust
-ignore::WalkBuilder::new(&repo.root)
-    .standard_filters(false)          // no implicit .gitignore/hidden rules
-    .add_custom_ignore_filename(".tgfsignore")
-    .filter_entry(|e| e.file_name() != REPO_DIR)
-    .sort_by_file_name(|a, b| a.cmp(b))
-    .build()
+jwalk::WalkDir::new(&repo.root)
+    .parallelism(Parallelism::RayonNewPool(threads.min(8)))
+    .skip_hidden(false)
+    .sort(true)
+    .process_read_dir(/* apply root ignore + config overrides */)
+    .try_into_iter()
 ```
 
-- The iterator is lazy: sorting happens per directory (same guarantee
-  restic gives), so the first entries arrive immediately regardless of
-  tree size.
-- `standard_filters(false)` keeps tgfs's semantics explicit: tgfs is a
-  backup tool, so `.gitignore` must **not** silently apply (a photo
+- Directory reads run concurrently while entries are yielded lazily in
+  strict, sorted depth-first order. This overlaps the high-latency
+  `getdents64` calls seen in Immich's empty hash-directory fan-out without
+  sacrificing deterministic status or pack order.
+- Ignore semantics remain explicit: tgfs is a backup tool, so `.gitignore`
+  must **not** silently apply (a photo
   library is not a git repo; and in a git repo, ignored build outputs may
   still be worth backing up — but `.git` rarely is, see below). Instead:
-  - `.tgfsignore` files (gitignore syntax, any directory level) are
-    honored via `add_custom_ignore_filename`.
+  - `<repo>/.tgfsignore` (gitignore syntax) is honored as one explicitly
+    added ignore file. Nested `.tgfsignore` discovery is deliberately
+    disabled: checking for it in every directory is pathological on trees
+    such as Immich's large empty hash-directory fan-out.
   - An optional `exclude = ["…"]` list in `.tgfs/config.toml` is compiled
     into an `ignore::overrides::Override` — the equivalent of restic's
     `--exclude`.
@@ -100,6 +104,9 @@ ignore::WalkBuilder::new(&repo.root)
 - Like restic's `SelectByName`, ignore matching happens on the name/path
   before metadata is fetched, so an excluded `node_modules/` costs one
   readdir entry, not a subtree stat storm.
+- Status uses up to eight jwalk workers. Push uses jwalk's serial mode because
+  its consumer pauses for network uploads and jwalk's ordered prefetch queue
+  is unbounded; both modes produce the same sorted depth-first order.
 
 Default excludes ship in the generated `.tgfs/config.toml` on `init`
 (`.git/`, `.DS_Store`, `Thumbs.db`) rather than being hardcoded, so the
@@ -161,6 +168,7 @@ pub(crate) enum ScanEvent {
 
 pub(crate) struct ScanStats {
     pub scanned: u64,         // files visited
+    pub dirs: u64,            // directories visited, including the root
     pub bytes: u64,           // their cumulative size
 }
 
@@ -227,8 +235,9 @@ I/O to decorate a command that should itself be fast. Split the
 difference:
 
 - **`status`**: no second walk. Emit `Progress` at most every 500 ms
-  (checked cheaply every 256 files) and render to **stderr** as a
-  carriage-return line: `scanning… 123456 files (487.3 GiB), 210 changed`
+  (checked cheaply every 256 files or directories) and render to **stderr** as a
+  carriage-return line:
+  `scanning… 123456 files, 98765 dirs (487.3 GiB), 210 changed`
   — cleared before the summary. stderr keeps `status`'s stdout pipeable
   and the progress invisible to scripts. Only emitted when stderr is a
   TTY.
@@ -257,11 +266,10 @@ must pass before any upload.
   mtime-restoring writes and same-mtime replacements), but it is a
   schema change (`files` gains `ctime`, `inode`) and orthogonal to the
   performance problem. Noted as follow-up, not done here.
-- **No parallel stat/hash workers.** The `ignore` crate offers a
-  parallel visitor and restic reads 2 files concurrently; tgfs's scan
-  does no content hashing, so the walk is metadata-bound and a single
-  thread saturates typical disks. Add parallelism only if profiling a
-  real Immich-sized tree on the target hardware says otherwise.
+- **No parallel stat/hash workers.** jwalk parallelizes directory reads, which
+  addresses the measured Immich bottleneck. Metadata conversion and hashing
+  remain ordered on the consuming thread; push also remains serial so its
+  walker cannot run ahead while uploads are pending.
 - **Index schema** is untouched except for the new read path
   (`stat_map`). Snapshot format, packing, encryption: unaffected.
 
@@ -271,7 +279,8 @@ must pass before any upload.
    no behavior change — existing tests must pass unchanged).
 2. Convert `walk_repo` to a lazy iterator; introduce `scan` +
    `ScanEvent`; port `status` and `push` onto it.
-3. Swap `walkdir` → `ignore`; add `.tgfsignore` + config `exclude`;
+3. Swap `walkdir` → `jwalk`; use `ignore` matchers for `.tgfsignore` and
+   config `exclude`;
    tests for exclusion semantics (excluded-but-indexed files must report
    as `Deleted`, matching git's behavior when a tracked file becomes
    ignored — and `push` will tombstone them, which the docs must say

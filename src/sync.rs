@@ -114,6 +114,7 @@ struct StatusReporter {
     new: Vec<String>,
     modified: Vec<String>,
     deleted: Vec<String>,
+    stats: diff::ScanStats,
 }
 
 impl StatusReporter {
@@ -125,6 +126,7 @@ impl StatusReporter {
             new: Vec::new(),
             modified: Vec::new(),
             deleted: Vec::new(),
+            stats: diff::ScanStats::default(),
         }
     }
 
@@ -162,17 +164,21 @@ impl StatusReporter {
                 self.changes.deleted += 1;
                 self.path("deleted:", path);
             }
-            diff::ScanEvent::Progress(stats) if self.progress => {
+            diff::ScanEvent::Progress(stats) => {
+                self.stats = stats;
+                if !self.progress {
+                    return;
+                }
                 let changed = self.changes.new + self.changes.modified + self.changes.deleted;
                 eprint!(
-                    "\r\x1b[2Kscanning… {} files ({}), {} changed",
+                    "\r\x1b[2Kscanning… {} files, {} dirs ({}), {} changed",
                     stats.scanned,
+                    stats.dirs,
                     human_size(stats.bytes),
                     changed
                 );
                 let _ = std::io::stderr().flush();
             }
-            diff::ScanEvent::Progress(_) => {}
         }
     }
 
@@ -185,16 +191,17 @@ impl StatusReporter {
         }
         if self.changes.is_clean() {
             println!(
-                "0 new, 0 modified, 0 deleted, {} unchanged — working tree clean",
-                self.changes.unchanged
+                "0 new, 0 modified, 0 deleted, {} unchanged, {} dirs — working tree clean",
+                self.changes.unchanged, self.stats.dirs
             );
         } else {
             println!(
-                "{} new, {} modified, {} deleted, {} unchanged — run `tgfs push` to upload",
+                "{} new, {} modified, {} deleted, {} unchanged, {} dirs — run `tgfs push` to upload",
                 self.changes.new,
                 self.changes.modified,
                 self.changes.deleted,
-                self.changes.unchanged
+                self.changes.unchanged,
+                self.stats.dirs
             );
         }
         self.changes
@@ -297,7 +304,7 @@ pub async fn push(
     let show_progress = std::io::stderr().is_terminal();
     let mut last_progress = None::<Instant>;
 
-    for event in diff::Scanner::new(&context.repo, &context.index)? {
+    for event in diff::Scanner::new_for_push(&context.repo, &context.index)? {
         let local_file = match event? {
             diff::ScanEvent::Unchanged(file) => {
                 drop(file);
@@ -311,8 +318,9 @@ pub async fn push(
             diff::ScanEvent::Progress(stats) => {
                 if show_progress {
                     eprint!(
-                        "\r\x1b[2Kpushing… {} files scanned ({}), {changed} changed, {uploaded_files} uploaded",
+                        "\r\x1b[2Kpushing… {} files, {} dirs scanned ({}), {changed} changed, {uploaded_files} uploaded",
                         stats.scanned,
+                        stats.dirs,
                         human_size(stats.bytes)
                     );
                     let _ = std::io::stderr().flush();

@@ -1,6 +1,7 @@
 //! Local SQLite metadata index: which files exist, which chunks make them
 //! up, and where those chunks live in the storage channel.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -139,6 +140,20 @@ impl Index {
         Ok(Some(row.into_entry(chunks)))
     }
 
+    /// Return the metadata used by working-tree change detection in one query.
+    pub fn stat_map(&self) -> Result<HashMap<String, (u64, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, size, mtime FROM files WHERE deleted = 0")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, u64>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<HashMap<_, _>, _>>()?)
+    }
+
     pub fn chunk(&self, hash: &str) -> Result<Option<ChunkEntry>> {
         Ok(self
             .conn
@@ -201,27 +216,12 @@ impl Index {
         Ok(())
     }
 
-    /// Mark files under `prefix` that are not in `alive` as deleted
-    /// (tombstoned). Returns the number of tombstones added.
-    pub fn tombstone_missing(&self, prefix: &str, alive: &[String]) -> Result<usize> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path FROM files WHERE deleted = 0 AND path LIKE ?1 || '%'")?;
-        let known = stmt
-            .query_map(params![prefix], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let alive: std::collections::HashSet<&str> = alive.iter().map(|s| s.as_str()).collect();
-        let mut count = 0;
-        for path in known {
-            if !alive.contains(path.as_str()) {
-                self.conn.execute(
-                    "UPDATE files SET deleted = 1 WHERE path = ?1",
-                    params![path],
-                )?;
-                count += 1;
-            }
-        }
-        Ok(count)
+    /// Tombstone one indexed path. Returns whether a live row changed.
+    pub fn tombstone_file(&self, path: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE files SET deleted = 1 WHERE path = ?1 AND deleted = 0",
+            params![path],
+        )? != 0)
     }
 
     pub fn list_files(
@@ -468,6 +468,31 @@ mod tests {
     }
 
     #[test]
+    fn stat_map_contains_only_live_files() {
+        let (mut index, path) = temp_index();
+        for name in ["live.txt", "gone.txt"] {
+            index
+                .upsert_file(&FileEntry {
+                    path: name.into(),
+                    size: 12,
+                    mtime: 34,
+                    hash: "h".into(),
+                    deleted: false,
+                    chunks: vec![],
+                })
+                .unwrap();
+        }
+        assert!(index.tombstone_file("gone.txt").unwrap());
+        assert!(!index.tombstone_file("gone.txt").unwrap());
+
+        let stats = index.stat_map().unwrap();
+        assert_eq!(stats.get("live.txt"), Some(&(12, 34)));
+        assert!(!stats.contains_key("gone.txt"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn tombstone_and_export() {
         let (mut index, path) = temp_index();
         for name in ["docs/a.txt", "docs/b.txt"] {
@@ -482,10 +507,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let n = index
-            .tombstone_missing("docs/", &["docs/a.txt".to_string()])
-            .unwrap();
-        assert_eq!(n, 1);
+        assert!(index.tombstone_file("docs/b.txt").unwrap());
         let visible = index.list_files(Some("docs/"), false).unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].path, "docs/a.txt");

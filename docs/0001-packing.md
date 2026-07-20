@@ -255,9 +255,17 @@ into one ranged read, but it is not required for correctness.
   orphaned in the channel; the next push re-uploads. Same exposure as
   today's per-chunk path, just bigger; bounded by `target_size`, and
   `tgfs prune` (future) can drop unreferenced pack messages.
-- **`FLOOD_WAIT`**: unchanged — handled by the retry policy. Packing
-  reduces the number of `send_uploaded` calls by orders of magnitude,
-  which is the point.
+- **`FLOOD_WAIT`**: one uploader actor accepts big-part and small-file jobs over
+  an input channel and acknowledges each caller over a one-shot channel. It
+  starts four jobs concurrently. Failed jobs move to the actor's private retry
+  queue, which is always drained before new input; this avoids re-enqueueing
+  into the bounded input channel while callers are waiting for acknowledgements.
+  The first server flood wait pauses dispatch for the requested cooldown and
+  reduces concurrency to one. After the cooldown, successful uploads raise the
+  limit by one per throttle-free minute until it returns to four; another flood
+  immediately resets it to one and restarts the gradual recovery. Packing
+  reduces the number of `send_uploaded` calls by orders of magnitude, which is
+  the point.
 
 ## 8. Garbage & future work
 

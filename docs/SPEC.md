@@ -59,9 +59,11 @@ stable message IDs, and access control.
   contiguous prefix of confirmed parts is journaled in the local index
   (`upload_journal`), so an interrupted 2 GiB upload continues from where it
   stopped instead of restarting.
-- Flood waits are handled by a client-wide retry policy: `FLOOD_WAIT_X` is
-  slept out (up to 30 minutes, as instructed by the server) and transient
-  I/O errors retry with exponential backoff.
+- One uploader actor owns retries and parallelism. On `FLOOD_WAIT_X` it pauses
+  for the server-requested delay (up to 30 minutes) and reduces concurrency
+  from four to one. Successful uploads then restore one slot per
+  throttle-free minute; another flood resets the limit to one. Transient I/O
+  errors retry with exponential backoff.
 - Optional client-side encryption (`tgfs init --encrypt`), since Telegram
   cloud chats are not E2E-encrypted: XChaCha20-Poly1305 over independent
   1 MiB segments, with nonces derived (keyed BLAKE3) from the chunk's
@@ -214,7 +216,7 @@ Out of scope for v1, but the design keeps it possible:
       already-uploaded chunks are skipped on retry; part-level resume within a
       chunk is left to M4).
 - [x] **M3** — SQLite index, `push`/`ls`/`get`, remote index snapshots.
-- [x] **M4** — hardening: FLOOD_WAIT handling (client-wide retry policy),
+- [x] **M4** — hardening: FLOOD_WAIT handling (coordinated uploader actor),
       parallel part uploads, part-level resume (journaled), client-side
       encryption, index restore from a pinned snapshot (`pull`/`clone`).
 - [x] **M4.5** — sharing: `share`/`unshare`/`members` on top of channel

@@ -39,6 +39,19 @@ struct BackupRetry {
     transfers: Arc<TransferActivity>,
 }
 
+/// Upload jobs own their retry queue, so their client must surface every
+/// failure to the uploader actor instead of sleeping inside `Client::invoke`.
+struct UploadJobRetry;
+
+impl grammers_client::client::RetryPolicy for UploadJobRetry {
+    fn should_retry(
+        &self,
+        _ctx: &grammers_client::client::RetryContext,
+    ) -> std::ops::ControlFlow<(), std::time::Duration> {
+        std::ops::ControlFlow::Break(())
+    }
+}
+
 impl grammers_client::client::RetryPolicy for BackupRetry {
     fn should_retry(
         &self,
@@ -84,7 +97,7 @@ impl grammers_client::client::RetryPolicy for BackupRetry {
     }
 }
 
-fn clear_progress_line() {
+pub(crate) fn clear_progress_line() {
     let mut stderr = std::io::stderr();
     if stderr.is_terminal() {
         let _ = write!(stderr, "\r\x1b[2K");
@@ -94,6 +107,7 @@ fn clear_progress_line() {
 
 pub struct Tg {
     pub client: Client,
+    pub(crate) uploader: crate::telegram_transfer::Uploader,
     session: Arc<FileSession>,
     transfers: Arc<TransferActivity>,
 }
@@ -144,7 +158,7 @@ impl Tg {
         let pool = SenderPool::new(Arc::clone(&session), api_id);
         let transfers = Arc::new(TransferActivity::default());
         let client = Client::with_configuration(
-            pool.handle,
+            pool.handle.clone(),
             grammers_client::client::ClientConfiguration {
                 retry_policy: Box::new(BackupRetry {
                     transfers: Arc::clone(&transfers),
@@ -152,9 +166,18 @@ impl Tg {
                 ..Default::default()
             },
         );
+        let upload_client = Client::with_configuration(
+            pool.handle,
+            grammers_client::client::ClientConfiguration {
+                retry_policy: Box::new(UploadJobRetry),
+                ..Default::default()
+            },
+        );
+        let uploader = crate::telegram_transfer::Uploader::spawn(upload_client);
         tokio::spawn(pool.runner.run());
         Ok(Self {
             client,
+            uploader,
             session,
             transfers,
         })

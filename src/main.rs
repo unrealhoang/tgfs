@@ -27,7 +27,10 @@ use tg::Tg;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::WARN.into())
+        .from_env_lossy();
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let cli = Cli::parse();
     match cli.command {
         Command::Login => login().await,

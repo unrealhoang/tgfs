@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
             let index = Index::open(&repo.index_path())?;
             for f in index.list_files(prefix.as_deref(), all)? {
                 let marker = if f.deleted { " (deleted)" } else { "" };
-                println!("{:>12}  {}{marker}", human_size(f.size), f.path);
+                println!("{:>12}  {}{marker}", file::human_size(f.size), f.path);
             }
             Ok(())
         }
@@ -327,21 +327,6 @@ async fn connect_authorized(global: &GlobalConfig) -> Result<Tg> {
         bail!("not logged in — run `tgfs login` first");
     }
     Ok(tg)
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 fn prompt(msg: &str) -> Result<String> {

@@ -174,7 +174,7 @@ impl StatusReporter {
                     "\r\x1b[2Kscanning… {} files, {} dirs ({}), {} changed",
                     stats.scanned,
                     stats.dirs,
-                    human_size(stats.bytes),
+                    file::human_size(stats.bytes),
                     changed
                 );
                 let _ = std::io::stderr().flush();
@@ -222,21 +222,6 @@ fn clear_progress(enabled: bool) {
     if enabled {
         eprint!("\r\x1b[2K");
         let _ = std::io::stderr().flush();
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -321,7 +306,7 @@ pub async fn push(
                         "\r\x1b[2Kpushing… {} files, {} dirs scanned ({}), {changed} changed, {uploaded_files} uploaded",
                         stats.scanned,
                         stats.dirs,
-                        human_size(stats.bytes)
+                        crate::file::human_size(stats.bytes)
                     );
                     let _ = std::io::stderr().flush();
                     last_progress = Some(Instant::now());

@@ -407,6 +407,21 @@ pub(crate) async fn download(
     Ok(out_path)
 }
 
+pub(crate) fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Hash a file, returning the whole-file hash and each `chunk_size` hash.
 fn hash_file(path: &Path, chunk_size: u64) -> Result<(String, Vec<String>)> {
     let mut file = std::fs::File::open(path)?;
@@ -604,5 +619,16 @@ mod tests {
 
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1536), "1.5 KiB");
+        assert_eq!(human_size(1048576), "1.0 MiB");
+        assert_eq!(human_size(1073741824), "1.0 GiB");
+        assert_eq!(human_size(1099511627776), "1.0 TiB");
     }
 }

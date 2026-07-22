@@ -1,3 +1,6 @@
+//! Repository discovery and configuration: per-machine account credentials,
+//! per-repo settings, packing constants, and locating a repo's `.tgfs/` state.
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 

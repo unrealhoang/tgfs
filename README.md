@@ -77,6 +77,33 @@ securely generates and prints a new key. On Unix, keyfiles with any group or
 other permissions are rejected; use `chmod 600 <path>` or create one with
 `genkey`.
 
+### Using as a library
+
+tgfs is also available as a Rust library for programs that want to use it
+directly, rather than shelling out to the CLI.
+
+```toml
+[dependencies]
+tgfs = { git = "https://github.com/unrealhoang/tgfs" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+```rust,ignore
+use tgfs::config::Repo;
+use tgfs::index::Index;
+
+// Read the local index of an existing repo without touching Telegram.
+let repo = Repo::discover(std::env::current_dir()?)?;
+let index = Index::open(&repo.index_path())?;
+for f in index.list_files(None, false)? {
+    println!("{}\t{}", f.size, f.path);
+}
+```
+
+Everything a subcommand can do (config, indexing, sync, encryption, Telegram
+transport) is available as a module, and the whole CLI is reusable in one
+call via `tgfs::commands::run`. The API is still 0.1.0 and may change.
+
 ### Building
 
 With cargo: `cargo build --release`. With nix flakes:

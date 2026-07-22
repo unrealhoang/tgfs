@@ -84,7 +84,7 @@ pub enum Command {
     Channels,
     /// Pull an existing tgfs channel into a new folder
     Clone {
-        /// Channel to clone: folder name or full channel title (tgfs-<name>)
+        /// Channel to clone: folder name or full channel title (`tgfs-<name>`)
         name: String,
         /// Destination folder (defaults to the name without the tgfs- prefix)
         dir: Option<PathBuf>,

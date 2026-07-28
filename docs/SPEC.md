@@ -94,9 +94,10 @@ truth:
    remote version). Used for fast diffing during `tgfs push`.
 2. **Remote index** — after each push, the index is serialized (JSON,
    zstd-compressed), uploaded to the same channel as a document, and the
-   message is **pinned**. Recovery on a new machine = find the pinned message,
-   download, rebuild SQLite. Old index snapshots are kept, giving free
-   point-in-time restore.
+   message is **pinned**, and the previously pinned snapshots are unpinned so
+   the channel holds exactly one pinned index. Recovery on a new machine =
+   find the pinned message, download, rebuild SQLite. The old snapshot
+   messages themselves are kept, giving free point-in-time restore.
 
 File `file_reference`s expire; the index stores enough (channel id +
 message id) to re-fetch fresh references on demand.

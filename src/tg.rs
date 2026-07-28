@@ -308,6 +308,13 @@ impl Tg {
             .context("failed to pin message")
     }
 
+    pub async fn unpin(&self, peer: PeerRef, msg_id: i32) -> Result<()> {
+        self.client
+            .unpin_message(peer, msg_id)
+            .await
+            .context("failed to unpin message")
+    }
+
     /// Resolve a `@username` (leading `@` optional) to a peer reference.
     pub async fn resolve_user(&self, username: &str) -> Result<PeerRef> {
         let username = username.trim_start_matches('@');

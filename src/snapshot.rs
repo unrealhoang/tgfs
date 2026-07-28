@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use grammers_client::session::types::PeerRef;
+use grammers_client::tl;
 
 use crate::context::RepoContext;
 use crate::crypto::Crypto;
@@ -33,6 +34,30 @@ impl Tg {
                 msg_id: message.id(),
             }),
         )
+    }
+
+    /// Every currently pinned message in the channel that is a tgfs index
+    /// snapshot. `remote_index_info` only sees the topmost pin, so this is
+    /// what push uses to clean up the pins left by earlier versions.
+    pub async fn pinned_indices(&self, peer: PeerRef) -> Result<Vec<RemoteIndexInfo>> {
+        let mut search = self
+            .client
+            .search_messages(peer)
+            .filter(tl::enums::MessagesFilter::InputMessagesFilterPinned);
+        let mut found = Vec::new();
+        while let Some(message) = search
+            .next()
+            .await
+            .context("failed to list pinned messages")?
+        {
+            if let Some(version) = parse_caption(message.text()) {
+                found.push(RemoteIndexInfo {
+                    version,
+                    msg_id: message.id(),
+                });
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -88,7 +113,30 @@ pub async fn publish(context: &RepoContext, crypto: Option<&Crypto>) -> Result<(
         dump.version,
         compressed.len()
     );
+    // Best effort: the snapshot is already published and recorded, so leftover
+    // pins are cosmetic — never fail a finished push over them.
+    match unpin_previous(&context.tg, peer, msg_id).await {
+        Ok(0) => {}
+        Ok(count) => println!("unpinned {count} previous index snapshot(s)"),
+        Err(error) => eprintln!("warning: could not unpin previous index snapshots: {error:#}"),
+    }
     Ok(())
+}
+
+/// Unpin the index snapshots of earlier pushes so the channel keeps exactly
+/// one pinned index. The old messages themselves stay in the channel for
+/// point-in-time restore. Pinning the new snapshot before unpinning the old
+/// ones means an interruption can only leave extra pins behind, never none.
+async fn unpin_previous(tg: &Tg, peer: PeerRef, keep: i32) -> Result<usize> {
+    let mut unpinned = 0;
+    for info in tg.pinned_indices(peer).await? {
+        if info.msg_id == keep {
+            continue;
+        }
+        tg.unpin(peer, info.msg_id).await?;
+        unpinned += 1;
+    }
+    Ok(unpinned)
 }
 
 /// Download the pinned snapshot and decrypt it when necessary.

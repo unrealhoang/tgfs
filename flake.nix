@@ -21,11 +21,18 @@
             cargoLock.lockFile = ./Cargo.lock;
 
             # libsql-ffi (grammers session storage) compiles its bundled
-            # sqlite via cmake and can regenerate bindings with bindgen;
-            # zstd-sys / rusqlite / blake3 only need a C compiler.
+            # sqlite via cmake and can regenerate bindings with bindgen.
+            # nixpkgs' cargo setup hook exports ZSTD_SYS_USE_PKG_CONFIG and
+            # LIBSQLITE3_SYS_USE_PKG_CONFIG, so zstd-sys / rusqlite link the
+            # system libraries through pkg-config instead of bundling them.
             nativeBuildInputs = [
               pkgs.cmake
+              pkgs.pkg-config
               pkgs.rustPlatform.bindgenHook
+            ];
+            buildInputs = [
+              pkgs.zstd
+              pkgs.sqlite
             ];
 
             # Tests are hermetic (no network); keep them on.
